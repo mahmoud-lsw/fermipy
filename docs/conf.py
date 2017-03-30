@@ -14,35 +14,33 @@
 
 import sys
 import os
-import shlex
 #import sphinx_bootstrap_theme
-from os import path
 
-import mock
-from mock import Mock as MagicMock
+if sys.version_info.major == 2:
+    import mock
+    from mock import Mock as MagicMock
+else:
+    from unittest import mock
+    from unittest.mock import Mock as MagicMock
 
 class Mock(MagicMock):
     @classmethod
     def __getattr__(cls, name):
-            return Mock()
+        return Mock()
 
 MOCK_MODULES = ['pyLikelihood','pyIrfLoader',
                 'BinnedAnalysis','UnbinnedAnalysis','SrcModel','AnalysisBase',
                 'SummedLikelihood','FluxDensity','LikelihoodState',
-                'GtApp','astropy',
-                'astropy.coordinates',
-                'astropy.io','astropy.wcs','astropy.io.fits',
-                'astropy.table','healpy','wcsaxes']
+                'GtApp']
 
 sys.modules.update((mod_name, Mock()) for mod_name in MOCK_MODULES)
-
-import matplotlib.colors
-matplotlib.colors.PowerNorm = mock.Mock()
 
 # If extensions (or modules to document with autodoc) are in another directory,
 # add these directories to sys.path here. If the directory is relative to the
 # documentation root, use os.path.abspath to make it absolute, like shown here.
 sys.path.insert(0, os.path.abspath('../../fermipy'))
+sys.path.insert(0, os.path.abspath('../../fermipy/jobs'))
+sys.path.insert(0, os.path.abspath('../../fermipy/diffuse'))
 sys.path.insert(0, os.path.abspath('../..'))
 sys.path.insert(0, os.path.abspath('..'))
 
@@ -198,7 +196,7 @@ if not on_rtd:  # only import and set the theme if we're building docs locally
 html_static_path = ['_static']
 
 def setup(app):
-   app.add_stylesheet("theme_overrides.css")
+    app.add_stylesheet("theme_overrides.css")
 
 #html_context = {
 #    'css_files': [
@@ -289,7 +287,7 @@ latex_elements = {
 # (source start file, target name, title,
 #  author, documentclass [howto, manual, or own class]).
 latex_documents = [
-  (master_doc, 'Fermipy.tex', u'Fermipy Documentation',
+    (master_doc, 'Fermipy.tex', u'Fermipy Documentation',
    u'Matthew Wood', 'manual'),
 ]
 
@@ -333,7 +331,7 @@ man_pages = [
 # (source start file, target name, title, author,
 #  dir menu entry, description, category)
 texinfo_documents = [
-  (master_doc, 'Fermipy', u'Fermipy Documentation',
+    (master_doc, 'Fermipy', u'Fermipy Documentation',
    author, 'Fermipy', 'One line description of project.',
    'Miscellaneous'),
 ]

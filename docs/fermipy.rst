@@ -3,8 +3,6 @@
 fermipy package
 ===============
 
-Submodules
-----------
 
 fermipy.config module
 ---------------------
@@ -55,6 +53,54 @@ fermipy.utils module
     :undoc-members:
     :show-inheritance:
 
+fermipy.plotting module
+-----------------------
+
+.. automodule:: fermipy.plotting
+    :members:
+    :undoc-members:
+    :show-inheritance:
+       
+fermipy.sed module
+------------------
+
+.. automodule:: fermipy.sed
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+fermipy.sourcefind module
+-------------------------
+
+.. automodule:: fermipy.sourcefind
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+fermipy.spectrum module
+-----------------------
+
+.. automodule:: fermipy.spectrum
+    :members:
+    :undoc-members:
+    :show-inheritance:
+       
+fermipy.skymap module
+---------------------
+
+.. automodule:: fermipy.skymap
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+fermipy.castro module
+---------------------
+
+.. automodule:: fermipy.castro
+    :members:
+    :undoc-members:
+    :show-inheritance:
+       
 fermipy.tsmap module
 --------------------
 
@@ -71,10 +117,10 @@ fermipy.residmap module
     :undoc-members:
     :show-inheritance:
 
-fermipy.sed module
-------------------
+fermipy.lightcurve module
+-------------------------
 
-.. automodule:: fermipy.sed
+.. automodule:: fermipy.lightcurve
     :members:
     :undoc-members:
     :show-inheritance:

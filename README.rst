@@ -9,9 +9,21 @@ Fermi-LAT Python Analysis Framework
 .. image:: https://travis-ci.org/fermiPy/fermipy.svg
     :target: https://travis-ci.org/fermiPy/fermipy
 
+.. image:: https://img.shields.io/coveralls/fermiPy/fermipy.svg
+    :target: https://coveralls.io/r/fermiPy/fermipy
+    :alt: Code Coverage
+
 .. image:: http://img.shields.io/pypi/v/fermipy.svg?text=version
     :target: https://pypi.python.org/pypi/fermipy/
     :alt: Latest release
+
+.. image:: https://anaconda.org/conda-forge/fermipy/badges/version.svg
+    :target: https://anaconda.org/conda-forge/fermipy
+    :alt: Latest conda release
+
+.. image:: https://img.shields.io/docker/automated/fermipy/fermipy.svg
+    :target: https://hub.docker.com/r/fermipy/fermipy/
+    :alt: Automated Docker Image
 
 .. image:: https://readthedocs.org/projects/fermipy/badge/?version=latest
     :target: https://readthedocs.org/projects/fermipy/?badge=latest

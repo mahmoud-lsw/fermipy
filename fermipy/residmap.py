@@ -1,14 +1,16 @@
+# Licensed under a 3-clause BSD style license - see LICENSE.rst
+from __future__ import absolute_import, division, print_function
 import copy
 import os
+import json
 import numpy as np
 import scipy.signal
-import fermipy.config
-import fermipy.defaults as defaults
 import fermipy.utils as utils
+import fermipy.wcs_utils as wcs_utils
+import fermipy.fits_utils as fits_utils
 import fermipy.plotting as plotting
-from fermipy.utils import Map
-from fermipy.logger import Logger
-from fermipy.logger import logLevel as ll
+from fermipy.skymap import Map
+from fermipy.config import ConfigSchema
 
 
 def poisson_lnl(nc, mu):
@@ -28,17 +30,17 @@ def poisson_lnl(nc, mu):
     return lnl
 
 
-def convolve_map(m, k, cpix, threshold=0.001,imin=0,imax=None):
+def convolve_map(m, k, cpix, threshold=0.001, imin=0, imax=None):
     """
     Perform an energy-dependent convolution on a sequence of 2-D spatial maps.
 
     Parameters
     ----------
-    
+
     m : `~numpy.ndarray`
        3-D map containing a sequence of 2-D spatial maps.  First
        dimension should be energy.
-    
+
     k : `~numpy.ndarray`
        3-D map containing a sequence of convolution kernels (PSF) for
        each slice in m.  This map should have the same dimension as m.
@@ -56,30 +58,32 @@ def convolve_map(m, k, cpix, threshold=0.001,imin=0,imax=None):
        Maximum index in energy dimension.
 
     """
-    islice = slice(imin,imax)
+    islice = slice(imin, imax)
 
-    o = np.zeros(m[islice,...].shape)
+    o = np.zeros(m[islice, ...].shape)
+    ix = int(cpix[0])
+    iy = int(cpix[1])
 
     # Loop over energy
-    for i in range(m[islice,...].shape[0]):
+    for i in range(m[islice, ...].shape[0]):
 
-        ks = k[islice,...][i,...]
-        ms = m[islice,...][i,...]
+        ks = k[islice, ...][i, ...]
+        ms = m[islice, ...][i, ...]
 
-        mx = ks[cpix[0], :] > ks[cpix[0], cpix[1]] * threshold
-        my = ks[:, cpix[1]] > ks[cpix[0], cpix[1]] * threshold
+        mx = ks[ix, :] > ks[ix, iy] * threshold
+        my = ks[:, iy] > ks[ix, iy] * threshold
 
-        nx = max(3, np.round(np.sum(mx) / 2.))
-        ny = max(3, np.round(np.sum(my) / 2.))
+        nx = int(max(3, np.round(np.sum(mx) / 2.)))
+        ny = int(max(3, np.round(np.sum(my) / 2.)))
 
         # Ensure that there is an odd number of pixels in the kernel
         # array
-        if cpix[0] + nx + 1 >= ms.shape[0] or cpix[0]-nx < 0:
-            nx -= 1        
+        if ix + nx + 1 >= ms.shape[0] or ix - nx < 0:
+            nx -= 1
             ny -= 1
 
-        sx = slice(cpix[0] - nx, cpix[0] + nx + 1)
-        sy = slice(cpix[1] - ny, cpix[1] + ny + 1)
+        sx = slice(ix - nx, ix + nx + 1)
+        sy = slice(iy - ny, iy + ny + 1)
 
         ks = ks[sx, sy]
 
@@ -89,9 +93,10 @@ def convolve_map(m, k, cpix, threshold=0.001,imin=0,imax=None):
 #        o[i,...] = ndimage.convolve(ms, ks, mode='constant',
 #                                     origin=origin, cval=0.0)
 
-        o[i,...] = scipy.signal.fftconvolve(ms, ks, mode='same')
+        o[i, ...] = scipy.signal.fftconvolve(ms, ks, mode='same')
 
     return o
+
 
 def get_source_kernel(gta, name, kernel=None):
     """Get the PDF for the given source."""
@@ -120,6 +125,7 @@ def get_source_kernel(gta, name, kernel=None):
 
     return sm
 
+
 class ResidMapGenerator(object):
     """Mixin class for `~fermipy.gtanalysis.GTAnalysis` that generates
     spatial residual maps from the difference of data and model maps
@@ -134,33 +140,13 @@ class ResidMapGenerator(object):
 
         Parameters
         ----------
-
         prefix : str
             String that will be prefixed to the output residual map files.
 
-        model : dict
-           Dictionary defining the properties of the convolution kernel.
-
-        exclude : str or list of str
-            Source or sources that will be removed from the model when
-            computing the residual map.
-
-        erange : list
-           Restrict the analysis to an energy range (emin,emax) in
-           log10(E/MeV) that is a subset of the analysis energy range.
-           By default the full analysis energy range will be used.  If
-           either emin/emax are None then only an upper/lower bound on
-           the energy range wil be applied.    
-
-        make_plots : bool        
-            Write image files.
-
-        make_fits : bool
-            Write FITS files.
+        {options}
 
         Returns
         -------
-
         maps : dict
            A dictionary containing the `~fermipy.utils.Map` objects
            for the residual significance and amplitude.    
@@ -169,42 +155,71 @@ class ResidMapGenerator(object):
 
         self.logger.info('Generating residual maps')
 
-        config = copy.deepcopy(self.config['residmap'])
-        config = utils.merge_dict(config,kwargs)
-        
-        make_plots = kwargs.get('make_plots', True)
-        maps = self._make_residual_map(prefix,config,**kwargs)
+        schema = ConfigSchema(self.defaults['residmap'])
 
-        if make_plots:
+        config = schema.create_config(self.config['residmap'], **kwargs)
+
+        # Defining default properties of test source model
+        config['model'].setdefault('Index', 2.0)
+        config['model'].setdefault('SpectrumType', 'PowerLaw')
+        config['model'].setdefault('SpatialModel', 'PointSource')
+        config['model'].setdefault('Prefactor', 1E-13)
+
+        o = self._make_residual_map(prefix, **config)
+
+        if config['make_plots']:
             plotter = plotting.AnalysisPlotter(self.config['plotting'],
                                                fileio=self.config['fileio'],
                                                logging=self.config['logging'])
-            
-            plotter.make_residual_plots(self, maps)
-            
-        self.logger.info('Finished residual maps')
-                
-        return maps
-        
-    def _make_residual_map(self, prefix, config, **kwargs):
 
-        make_fits = kwargs.get('make_fits', True)
-        
-        src_dict = copy.deepcopy(config.setdefault('model',{}))        
-        exclude = config.setdefault('exclude', None)
-        erange = config.setdefault('erange', None)
-        
-        if erange is not None:            
-            if len(erange) == 0:
-                erange = [None,None]
-            elif len(erange) == 1:
-                erange += [None]            
-            erange[0] = (erange[0] if erange[0] is not None 
-                         else self.energies[0])
-            erange[1] = (erange[1] if erange[1] is not None 
-                         else self.energies[-1])
+            plotter.make_residmap_plots(o, self.roi)
+
+        self.logger.info('Finished residual maps')
+
+        outfile = utils.format_filename(self.workdir, 'residmap',
+                                        prefix=[o['name']])
+
+        if config['write_fits']:
+            o['file'] = os.path.basename(outfile) + '.fits'
+            self._make_residmap_fits(o, outfile + '.fits')
+
+        if config['write_npy']:
+            np.save(outfile + '.npy', o)
+
+        return o
+
+    def _make_residmap_fits(self, data, filename, **kwargs):
+
+        maps = {'DATA_MAP': data['data'],
+                'MODEL_MAP': data['model'],
+                'EXCESS_MAP': data['excess']}
+
+        hdu_images = []
+        for k, v in sorted(maps.items()):
+            if v is None:
+                continue
+            hdu_images += [v.create_image_hdu(k)]
+
+        hdus = [data['sigma'].create_primary_hdu()] + hdu_images
+        hdus[0].header['CONFIG'] = json.dumps(data['config'])
+        hdus[1].header['CONFIG'] = json.dumps(data['config'])
+        fits_utils.write_hdus(hdus, filename)
+
+    def _make_residual_map(self, prefix, **kwargs):
+
+        src_dict = copy.deepcopy(kwargs.setdefault('model', {}))
+        exclude = kwargs.setdefault('exclude', None)
+        loge_bounds = kwargs.setdefault('loge_bounds', None)
+
+        if loge_bounds:
+            if len(loge_bounds) != 2:
+                raise Exception('Wrong size of loge_bounds array.')
+            loge_bounds[0] = (loge_bounds[0] if loge_bounds[0] is not None
+                              else self.log_energies[0])
+            loge_bounds[1] = (loge_bounds[1] if loge_bounds[1] is not None
+                              else self.log_energies[-1])
         else:
-            erange = [self.energies[0],self.energies[-1]]
+            loge_bounds = [self.log_energies[0], self.log_energies[-1]]
 
         # Put the test source at the pixel closest to the ROI center
         xpix, ypix = (np.round((self.npix - 1.0) / 2.),
@@ -212,7 +227,7 @@ class ResidMapGenerator(object):
         cpix = np.array([xpix, ypix])
 
         skywcs = self._skywcs
-        skydir = utils.pix_to_skydir(cpix[0], cpix[1], skywcs)
+        skydir = wcs_utils.pix_to_skydir(cpix[0], cpix[1], skywcs)
 
         if src_dict is None:
             src_dict = {}
@@ -232,8 +247,8 @@ class ResidMapGenerator(object):
             cpix = [50, 50]
 
         self.add_source('residmap_testsource', src_dict, free=True,
-                       init_source=False,save_source_maps=False)
-        src = self.roi.get_source_by_name('residmap_testsource', True)
+                        init_source=False, save_source_maps=False)
+        src = self.roi.get_source_by_name('residmap_testsource')
 
         modelname = utils.create_model_name(src)
         npix = self.components[0].npix
@@ -242,7 +257,7 @@ class ResidMapGenerator(object):
         cmst = np.zeros((npix, npix))
         emst = np.zeros((npix, npix))
 
-        sm = get_source_kernel(self,'residmap_testsource', kernel)
+        sm = get_source_kernel(self, 'residmap_testsource', kernel)
         ts = np.zeros((npix, npix))
         sigma = np.zeros((npix, npix))
         excess = np.zeros((npix, npix))
@@ -251,16 +266,16 @@ class ResidMapGenerator(object):
 
         for i, c in enumerate(self.components):
 
-            imin = utils.val_to_edge(c.energies,erange[0])[0]
-            imax = utils.val_to_edge(c.energies,erange[1])[0]
+            imin = utils.val_to_edge(c.log_energies, loge_bounds[0])[0]
+            imax = utils.val_to_edge(c.log_energies, loge_bounds[1])[0]
 
             mc = c.model_counts_map(exclude=exclude).counts.astype('float')
             cc = c.counts_map().counts.astype('float')
             ec = np.ones(mc.shape)
 
-            ccs = convolve_map(cc, sm[i], cpix,imin=imin,imax=imax)
-            mcs = convolve_map(mc, sm[i], cpix,imin=imin,imax=imax)
-            ecs = convolve_map(ec, sm[i], cpix,imin=imin,imax=imax)
+            ccs = convolve_map(cc, sm[i], cpix, imin=imin, imax=imax)
+            mcs = convolve_map(mc, sm[i], cpix, imin=imin, imax=imax)
+            ecs = convolve_map(ec, sm[i], cpix, imin=imin, imax=imax)
 
             cms = np.sum(ccs, axis=0)
             mms = np.sum(mcs, axis=0)
@@ -276,23 +291,6 @@ class ResidMapGenerator(object):
         ts = 2.0 * (poisson_lnl(cmst, cmst) - poisson_lnl(cmst, mmst))
         sigma = np.sqrt(ts)
         sigma[excess < 0] *= -1
-
-        sigma_map_file = utils.format_filename(self.config['fileio']['workdir'],
-                                               'residmap_sigma.fits',
-                                               prefix=[prefix, modelname])
-
-        data_map_file = utils.format_filename(self.config['fileio']['workdir'],
-                                              'residmap_data.fits',
-                                              prefix=[prefix, modelname])
-
-        model_map_file = utils.format_filename(self.config['fileio']['workdir'],
-                                               'residmap_model.fits',
-                                               prefix=[prefix, modelname])
-
-        excess_map_file = utils.format_filename(self.config['fileio']['workdir'],
-                                                'residmap_excess.fits',
-                                                prefix=[prefix, modelname])
-
         emst /= np.max(emst)
 
         sigma_map = Map(sigma, skywcs)
@@ -300,24 +298,12 @@ class ResidMapGenerator(object):
         data_map = Map(cmst / emst, skywcs)
         excess_map = Map(excess / emst, skywcs)
 
-        o = {'name': '%s_%s' % (prefix, modelname),
+        o = {'name': utils.join_strings([prefix, modelname]),
              'file': None,
              'sigma': sigma_map,
              'model': model_map,
              'data': data_map,
              'excess': excess_map,
-             'config' : config }
-        
-        if make_fits:
-
-            fits_file = utils.format_filename(self.config['fileio']['workdir'],
-                                              'residmap.fits',
-                                              prefix=[prefix,modelname])            
-            utils.write_maps(sigma_map,
-                             {'DATA_MAP': data_map,
-                              'MODEL_MAP': model_map,
-                              'EXCESS_MAP': excess_map },
-                             fits_file)
-            o['file'] = os.path.basename(fits_file)
+             'config': kwargs}
 
         return o

@@ -1,136 +1,231 @@
-import copy
+# Licensed under a 3-clause BSD style license - see LICENSE.rst
+from __future__ import absolute_import, division, print_function
+import os
 import numpy as np
+from astropy.io import fits
+from astropy.wcs import WCS
+import fermipy
+from fermipy import utils
+from fermipy.hpx_utils import HPX
 
-import astropy.io.fits as pyfits
-import astropy.wcs as pywcs
 
-from fermipy.utils import Map, read_energy_bounds
-from fermipy.hpx_utils import HpxMap, HPX
+def write_fits(hdulist, outfile, keywords):
+
+    for h in hdulist:
+        for k, v in keywords.items():
+            h.header[k] = v
+        h.header['CREATOR'] = 'fermipy ' + fermipy.__version__
+        h.header['STVER'] = fermipy.get_st_version()
+
+    hdulist.writeto(outfile, clobber=True)
 
 
-def read_map_from_fits(fitsfile, extname=None):
+def find_and_read_ebins(hdulist):
+    """  Reads and returns the energy bin edges.
+
+    This works for both the CASE where the energies are in the ENERGIES HDU
+    and the case where they are in the EBOUND HDU
     """
+    from fermipy import utils
+    ebins = None
+    if 'ENERGIES' in hdulist:
+        hdu = hdulist['ENERGIES']
+        ectr = hdu.data.field(hdu.columns[0].name)
+        ebins = np.exp(utils.center_to_edge(np.log(ectr)))
+    elif 'EBOUNDS' in hdulist:
+        hdu = hdulist['EBOUNDS']
+        emin = hdu.data.field('E_MIN') / 1E3
+        emax = hdu.data.field('E_MAX') / 1E3
+        ebins = np.append(emin, emax[-1])
+    return ebins
+
+
+def read_energy_bounds(hdu):
+    """ Reads and returns the energy bin edges from a FITs HDU
     """
-    proj, f, hdu = read_projection_from_fits(fitsfile, extname)
-    if isinstance(proj, pywcs.WCS):
-        m = Map(hdu.data, proj)
-    elif isinstance(proj, HPX):
-        m = HpxMap.create_from_hdu(hdu,proj.ebins)
+    nebins = len(hdu.data)
+    ebin_edges = np.ndarray((nebins + 1))
+    try:
+        ebin_edges[0:-1] = np.log10(hdu.data.field("E_MIN")) - 3.
+        ebin_edges[-1] = np.log10(hdu.data.field("E_MAX")[-1]) - 3.
+    except KeyError:
+        ebin_edges[0:-1] = np.log10(hdu.data.field("energy_MIN"))
+        ebin_edges[-1] = np.log10(hdu.data.field("energy_MAX")[-1])
+    return ebin_edges
+
+
+def read_spectral_data(hdu):
+    """ Reads and returns the energy bin edges, fluxes and npreds from
+    a FITs HDU
+    """
+    ebins = read_energy_bounds(hdu)
+    fluxes = np.ndarray((len(ebins)))
+    try:
+        fluxes[0:-1] = hdu.data.field("E_MIN_FL")
+        fluxes[-1] = hdu.data.field("E_MAX_FL")[-1]
+        npreds = hdu.data.field("NPRED")
+    except:
+        fluxes = np.ones((len(ebins)))
+        npreds = np.ones((len(ebins)))
+    return ebins, fluxes, npreds
+
+
+def make_energies_hdu(energy_vals, extname="ENERGIES"):
+    """ Builds and returns a FITs HDU with the energy values
+
+    extname   : The HDU extension name           
+    """
+    cols = [fits.Column("Energy", "D", unit='MeV', array=energy_vals)]
+    hdu = fits.BinTableHDU.from_columns(cols, name=extname)
+    return hdu
+
+
+def write_maps(primary_map, maps, outfile, **kwargs):
+
+    if primary_map is None:
+        hdu_images = [fits.PrimaryHDU()]
     else:
-        raise Exception("Did not recognize projection type %s" % type(proj))
-    return m,f
+        hdu_images = [primary_map.create_primary_hdu()]
+
+    for k, v in sorted(maps.items()):
+        hdu_images += [v.create_image_hdu(k, **kwargs)]
+
+    energy_hdu = kwargs.get('energy_hdu', None)
+    if energy_hdu:
+        hdu_images += [energy_hdu]
+
+    write_hdus(hdu_images, outfile)
+
+
+def write_hdus(hdus, outfile, **kwargs):
+
+    keywords = kwargs.get('keywords', {})
+
+    hdulist = fits.HDUList(hdus)
+    for h in hdulist:
+
+        for k, v in keywords.items():
+            h.header[k] = v
+
+        h.header['CREATOR'] = 'fermipy ' + fermipy.__version__
+        h.header['STVER'] = fermipy.get_st_version()
+    hdulist.writeto(outfile, clobber=True)
+
+
+def write_fits_image(data, wcs, outfile):
+    hdu_image = fits.PrimaryHDU(data, header=wcs.to_header())
+    hdulist = fits.HDUList([hdu_image])
+    hdulist.writeto(outfile, clobber=True)
+
+
+def write_hpx_image(data, hpx, outfile, extname="SKYMAP"):
+    hpx.write_fits(data, outfile, extname, clobber=True)
 
 
 def read_projection_from_fits(fitsfile, extname=None):
     """
     Load a WCS or HPX projection.
     """
-    f = pyfits.open(fitsfile)
+    f = fits.open(fitsfile)
     nhdu = len(f)
     # Try and get the energy bounds
     try:
-        ebins = read_energy_bounds(f['EBOUNDS'])
+        ebins = find_and_read_ebins(f)
     except:
         ebins = None
-    
+
     if extname is None:
-        # If there is an image in the Primary HDU we can return a WCS-based projection
+        # If there is an image in the Primary HDU we can return a WCS-based
+        # projection
         if f[0].header['NAXIS'] != 0:
-            proj = pywcs.WCS(f[0].header)
-            return proj,f,f[0]
+            proj = WCS(f[0].header)
+            return proj, f, f[0]
     else:
         if f[extname].header['XTENSION'] == 'IMAGE':
-            proj = pywcs.WCS(f[extname].header)
-            return proj,f,f[extname]
+            proj = WCS(f[extname].header)
+            return proj, f, f[extname]
+        elif extname in ['SKYMAP', 'SKYMAP2']:
+            proj = HPX.create_from_header(f[extname].header, ebins)
+            return proj, f, f[extname]
         elif f[extname].header['XTENSION'] == 'BINTABLE':
-            try: 
+            try:
                 if f[extname].header['PIXTYPE'] == 'HEALPIX':
-                    proj = HPX.create_from_header(f[extname].header,ebins)
-                    return proj,f,f[extname]
+                    proj = HPX.create_from_header(f[extname].header, ebins)
+                    return proj, f, f[extname]
             except:
                 pass
-        return None,f,None 
-            
+        return None, f, None
+
     # Loop on HDU and look for either an image or a table with HEALPix data
-    for i in range(1,nhdu):
+    for i in range(1, nhdu):
         # if there is an image we can return a WCS-based projection
         if f[i].header['XTENSION'] == 'IMAGE':
-            proj = pywcs.WCS(f[i].header)
-            return proj,f,f[i]
+            proj = WCS(f[i].header)
+            return proj, f, f[i]
         elif f[i].header['XTENSION'] == 'BINTABLE':
-            try: 
+            if f[i].name in ['SKYMAP', 'SKYMAP2']:
+                proj = HPX.create_from_header(f[i].header, ebins)
+                return proj, f, f[i]
+            try:
                 if f[i].header['PIXTYPE'] == 'HEALPIX':
-                    proj = HPX.create_from_header(f[i].header,ebins)
-                    return proj,f,f[i]
+                    proj = HPX.create_from_header(f[i].header, ebins)
+                    return proj, f, f[i]
             except:
                 pass
-        pass
-    return None,f,None
+
+    return None, f, None
 
 
-def make_coadd_map(maps, proj, shape):
-    # this is a hack
-    from hpx_utils import make_coadd_hpx, HPX
-    if isinstance(proj, pywcs.WCS):
-        return make_coadd_wcs(maps, proj, shape)
-    elif isinstance(proj, HPX):
-        return make_coadd_hpx(maps, proj, shape)
-    else:
-        raise Exception("Can't co-add map of unknown type %s" % type(proj))
+def write_tables_to_fits(filepath, tablelist, clobber=False,
+                         namelist=None, cardslist=None, hdu_list=None):
+    """
+    Write some astropy.table.Table objects to a single fits file
+    """
+    outhdulist = [fits.PrimaryHDU()]
+    rmlist = []
+    for i, table in enumerate(tablelist):
+        ft_name = "%s._%i" % (filepath, i)
+        rmlist.append(ft_name)
+        try:
+            os.unlink(ft_name)
+        except:
+            pass
+        table.write(ft_name, format="fits")
+        ft_in = fits.open(ft_name)
+        if namelist:
+            ft_in[1].name = namelist[i]
+        if cardslist:
+            for k, v in cardslist[i].items():
+                ft_in[1].header[k] = v
+        ft_in[1].update()
+        outhdulist += [ft_in[1]]
+
+    if hdu_list is not None:
+        for h in hdu_list:
+            outhdulist.append(h)
+
+    fits.HDUList(outhdulist).writeto(filepath, clobber=clobber)
+    for rm in rmlist:
+        os.unlink(rm)
 
 
-def make_coadd_wcs(maps, wcs, shape):
-    data = np.zeros(shape)
-    axes = wcs_to_axes(wcs, shape)
+def dict_to_table(input_dict):
 
-    for m in maps:
-        c = wcs_to_coords(m.wcs, m.counts.shape)
-        o = np.histogramdd(c.T, bins=axes[::-1], weights=np.ravel(m.counts))[0]
-        data += o
+    from astropy.table import Table, Column
 
-    return Map(data, copy.deepcopy(wcs))
+    cols = []
 
+    for k, v in sorted(input_dict.items()):
 
-def wcs_to_axes(w, npix):
-    """Generate a sequence of bin edge vectors corresponding to the
-    axes of a WCS object."""
+        if isinstance(v, dict):
+            continue
+        elif isinstance(v, float):
+            cols += [Column(name=k, dtype='f8', data=np.array([v]))]
+        elif isinstance(v, bool):
+            cols += [Column(name=k, dtype=bool, data=np.array([v]))]
+        elif utils.isstr(v):
+            cols += [Column(name=k, dtype='S32', data=np.array([v]))]
+        elif isinstance(v, np.ndarray):
+            cols += [Column(name=k, dtype=v.dtype, data=np.array([v]))]
 
-    npix = npix[::-1]
-
-    x = np.linspace(-(npix[0]) / 2., (npix[0]) / 2.,
-                    npix[0] + 1) * np.abs(w.wcs.cdelt[0])
-    y = np.linspace(-(npix[1]) / 2., (npix[1]) / 2.,
-                    npix[1] + 1) * np.abs(w.wcs.cdelt[1])
-
-    cdelt2 = np.log10((w.wcs.cdelt[2] + w.wcs.crval[2]) / w.wcs.crval[2])
-
-    z = (np.linspace(0, npix[2], npix[2] + 1)) * cdelt2
-    z += np.log10(w.wcs.crval[2])
-
-    return x, y, z
-
-
-def wcs_to_coords(w, shape):
-    """Generate an N x D list of pixel center coordinates where N is
-    the number of pixels and D is the dimensionality of the map."""
-    if w.naxis == 2:
-        y, x = wcs_to_axes(w,shape)
-    elif w.naxis == 3:
-        z, y, x = wcs_to_axes(w,shape)
-    else:
-        raise Exception("Wrong number of WCS axes %i"%w.naxis)
-    
-    x = 0.5*(x[1:] + x[:-1])
-    y = 0.5*(y[1:] + y[:-1])
-
-    if w.naxis == 2:
-        x = np.ravel(np.ones(shape)*x[:,np.newaxis])
-        y = np.ravel(np.ones(shape)*y[np.newaxis,:])
-        return np.vstack((x,y))    
-
-    z = 0.5*(z[1:] + z[:-1])    
-    x = np.ravel(np.ones(shape)*x[:,np.newaxis,np.newaxis])
-    y = np.ravel(np.ones(shape)*y[np.newaxis,:,np.newaxis])       
-    z = np.ravel(np.ones(shape)*z[np.newaxis,np.newaxis,:])
-         
-    return np.vstack((x,y,z))    
+    return Table(cols)

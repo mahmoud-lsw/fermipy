@@ -1,4 +1,5 @@
-
+# Licensed under a 3-clause BSD style license - see LICENSE.rst
+from __future__ import absolute_import, division, print_function
 import os
 import sys
 import logging
@@ -6,17 +7,19 @@ import logging.config
 import yaml
 import fermipy
 
-def logLevel(level):
-    '''This is a function that returns a python like
-    level from a HEASOFT like level.'''
 
-    levels_dict = {0:50,
-                   1:40,
-                   2:30,
-                   3:20,
-                   4:10}
+def log_level(level):
+    """This is a function that returns a python like
+    level from a HEASOFT like level.
+    """
 
-    if not isinstance(level,int):
+    levels_dict = {0: 50,
+                   1: 40,
+                   2: 30,
+                   3: 20,
+                   4: 10}
+
+    if not isinstance(level, int):
         level = int(level)
 
     if level > 4:
@@ -28,17 +31,17 @@ def logLevel(level):
 class Logger(object):
     """This class provides helper functions which facilitate creating
     instances of the built-in logger class."""
-    
+
     @staticmethod
-    def setup(config=None,logfile=None):
+    def setup(config=None, logfile=None):
         """This method sets up the default configuration of the
         logger.  Once this method is called all subsequent instances
         Logger instances will inherit this configuration."""
 
         if config is None:
-            configpath = os.path.join(fermipy.PACKAGE_ROOT,'config',
+            configpath = os.path.join(fermipy.PACKAGE_ROOT, 'config',
                                       'logging.yaml')
-            with open(configpath,'r') as f:
+            with open(configpath, 'r') as f:
                 config = yaml.load(f)
 
         # Update configuration
@@ -46,7 +49,7 @@ class Logger(object):
             for name, h in config['handlers'].items():
                 if 'file_handler' in name:
                     config['handlers'][name]['filename'] = logfile
-            
+
         logging.config.dictConfig(config)
 
         # get the root logger
@@ -54,17 +57,24 @@ class Logger(object):
 #        for h in logger.handlers:
 #            if 'file_handler' in h.name:
 #                print h.name
-        
+
     @staticmethod
     def get(name, logfile, loglevel=logging.DEBUG):
+        """Create a python logger instance.
 
-#        logging.config.dictConfig({
-#                'version': 1,              
-#                'disable_existing_loggers': False})
-        
-        if not logfile is None:
-            logfile = logfile.replace('.log','') + '.log'
-        
+        Parameters
+        ----------
+        name : str
+            Logger name.
+        """
+
+        #        logging.config.dictConfig({
+        #                'version': 1,
+        #                'disable_existing_loggers': False})
+
+        if logfile is not None:
+            logfile = logfile.replace('.log', '') + '.log'
+
         logger = logging.getLogger(name)
 
         # Don't propagate to root logger
@@ -72,30 +82,33 @@ class Logger(object):
         logger.setLevel(logging.DEBUG)
 
         datefmt = '%Y-%m-%d %H:%M:%S'
-        format_stream = '%(asctime)s %(levelname)-8s %(name)s.%(funcName)s(): %(message)s'
-        format_file = '%(asctime)s %(levelname)-8s %(name)s.%(funcName)s(): %(message)s' 
-#        format_file = '%(asctime)s %(levelname)-8s %(name)s.%(funcName)s() [%(filename)s:%(lineno)d]: %(message)s' 
-        
+        format_stream = ('%(asctime)s %(levelname)-8s'
+                         '%(name)s.%(funcName)s(): %(message)s')
+        format_file = ('%(asctime)s %(levelname)-8s'
+                       '%(name)s.%(funcName)s(): %(message)s')
+#        format_file = ('%(asctime)s %(levelname)-8s '
+#                       '%(name)s.%(funcName)s() '
+#                       '[%(filename)s:%(lineno)d]: %(message)s')
+
         if not logger.handlers:
 
-            formatter = logging.Formatter(format,datefmt)
-
             # Add a file handler
-            if not logfile is None:
+            if logfile is not None:
                 fh = logging.FileHandler(logfile)
                 fh.setLevel(logging.DEBUG)
-                fh.setFormatter(logging.Formatter(format_file,datefmt))
+                fh.setFormatter(logging.Formatter(format_file, datefmt))
                 logger.addHandler(fh)
-            
+
             # Add a stream handler
             ch = logging.StreamHandler()
             ch.setLevel(loglevel)
-            ch.setFormatter(logging.Formatter(format_stream,datefmt))
+            ch.setFormatter(logging.Formatter(format_stream, datefmt))
             logger.addHandler(ch)
         else:
             logger.handlers[-1].setLevel(loglevel)
-            
+
         return logger
+
 
 class StreamLogger(object):
     """File-like object to log stdout/stderr using the `logging` module."""
@@ -103,13 +116,14 @@ class StreamLogger(object):
     def __init__(self, name='stdout', logfile=None, quiet=True):
         self.logger = logging.getLogger(name)
         self.logger.setLevel(logging.DEBUG)
-        self.format = '%(asctime)s - %(name)s - %(funcName)s - %(levelname)s - %(message)s'
-        self.datefmt='%Y-%m-%d %H:%M:%S'
+        self.format = ('%(asctime)s - %(name)s - %(funcName)s - '
+                       '%(levelname)s - %(message)s')
+        self.datefmt = '%Y-%m-%d %H:%M:%S'
         self.stdout = sys.stdout
-#        logging.basicConfig(level=logging.DEBUG, 
+#        logging.basicConfig(level=logging.DEBUG,
 #                            format=self.format, filename=file)
 
-        self.formatter = logging.Formatter(self.format,self.datefmt)
+        self.formatter = logging.Formatter(self.format, self.datefmt)
         fhdlr = logging.FileHandler(logfile)
         fhdlr.setFormatter(self.formatter)
         self.logger.addHandler(fhdlr)
@@ -132,7 +146,7 @@ class StreamLogger(object):
         self.flush()
         sys.stdout = self.stdout
         self.logger.handlers = []
-        
+
     def write(self, msg, level=logging.DEBUG):
         msg = msg.rstrip('\n')
         if len(msg) > 0:

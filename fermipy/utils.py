@@ -1,218 +1,253 @@
+# Licensed under a 3-clause BSD style license - see LICENSE.rst
+from __future__ import absolute_import, division, print_function
 import os
+import re
 import copy
+import tempfile
+import functools
 from collections import OrderedDict
-
-import numpy as np
 import xml.etree.cElementTree as et
-from astropy import units as u
-from astropy.coordinates import SkyCoord
-import astropy.io.fits as pyfits
-import astropy.wcs as pywcs
-import scipy.special as specialfn
+import yaml
+import numpy as np
+import scipy.optimize
+from scipy.ndimage import map_coordinates
 from scipy.interpolate import UnivariateSpline
 from scipy.optimize import brentq
+from scipy.ndimage.measurements import label
 import scipy.special as special
+from numpy.core import defchararray
+from astropy.extern import six
 
-def read_energy_bounds(hdu):
-    """ Reads and returns the energy bin edges from a FITs HDU
-    """
-    nebins = len(hdu.data)
-    ebin_edges = np.ndarray((nebins+1))
-    ebin_edges[0:-1] = np.log10(hdu.data.field("E_MIN")) - 3.
-    ebin_edges[-1] = np.log10(hdu.data.field("E_MAX")[-1]) - 3.
-    return ebin_edges
 
-def read_spectral_data(hdu):
-    """ Reads and returns the energy bin edges, fluxes and npreds from
-    a FITs HDU
+def init_matplotlib_backend(backend=None):
+    """This function initializes the matplotlib backend.  When no
+    DISPLAY is available the backend is automatically set to 'Agg'.
+
+    Parameters
+    ----------
+    backend : str
+       matplotlib backend name.
     """
-    ebins = read_energy_bounds(hdu)
-    fluxes = np.ndarray((len(ebins)))
+
+    import matplotlib
+
     try:
-        fluxes[0:-1] = hdu.data.field("E_MIN_FL")
-        fluxes[-1] = hdu.data.field("E_MAX_FL")[-1]
-        npreds = hdu.data.field("NPRED")
-    except:
-        fluxes =  np.ones((len(ebins)))
-        npreds =  np.ones((len(ebins)))
-    return ebins,fluxes,npreds
-    
-
-class Map_Base(object):
-    """ Abstract representation of a 2D or 3D counts map."""
-
-    def __init__(self, counts):
-        self._counts = counts
-
-    @property
-    def counts(self):
-        return self._counts
+        os.environ['DISPLAY']
+    except KeyError:
+        matplotlib.use('Agg')
+    else:
+        if backend is not None:
+            matplotlib.use(backend)
 
 
-class Map(Map_Base):
-    """ Representation of a 2D or 3D counts map using WCS. """
+def unicode_representer(dumper, uni):
+    node = yaml.ScalarNode(tag=u'tag:yaml.org,2002:str', value=uni)
+    return node
 
-    def __init__(self, counts, wcs):
-        """
-        Parameters
-        ----------
-        counts : `~numpy.ndarray`
-          Counts array.
-        """
-        Map_Base.__init__(self, counts)
-        self._wcs = wcs
 
-        self._npix = counts.shape
+yaml.add_representer(six.text_type, unicode_representer)
 
-        if len(self._npix) == 3:
-            xindex = 2
-            yindex = 1
-        elif len(self._npix) == 2:
-            xindex = 1
-            yindex = 0
+
+def load_yaml(infile, **kwargs):
+    return yaml.load(open(infile), **kwargs)
+
+
+def write_yaml(o, outfile, **kwargs):
+    yaml.dump(tolist(o), open(outfile, 'w'), **kwargs)
+
+
+def load_npy(infile):
+    return np.load(infile).flat[0]
+
+
+def load_data(infile, workdir=None):
+    """Load python data structure from either a YAML or numpy file. """
+    infile = resolve_path(infile, workdir=workdir)
+    infile, ext = os.path.splitext(infile)
+
+    if os.path.isfile(infile + '.npy'):
+        infile += '.npy'
+    elif os.path.isfile(infile + '.yaml'):
+        infile += '.yaml'
+    else:
+        raise Exception('Input file does not exist.')
+
+    ext = os.path.splitext(infile)[1]
+
+    if ext == '.npy':
+        return infile, load_npy(infile)
+    elif ext == '.yaml':
+        return infile, load_yaml(infile)
+    else:
+        raise Exception('Unrecognized extension.')
+
+
+def resolve_path(path, workdir=None):
+    if os.path.isabs(path):
+        return path
+    elif workdir is None:
+        return os.path.abspath(path)
+    else:
+        return os.path.join(workdir, path)
+
+
+def resolve_file_path(path, **kwargs):
+    dirs = kwargs.get('search_dirs', [])
+    expand = kwargs.get('expand', False)
+
+    if path is None:
+        return None
+
+    out_path = None
+    if os.path.isabs(os.path.expandvars(path)) and \
+            os.path.isfile(os.path.expandvars(path)):
+        out_path = path
+    else:
+        for d in dirs:
+            if not os.path.isdir(os.path.expandvars(d)):
+                continue
+            p = os.path.join(d, path)
+            if os.path.isfile(os.path.expandvars(p)):
+                out_path = p
+                break
+
+    if out_path is None:
+        raise Exception('Failed to resolve file path: %s' % path)
+
+    if expand:
+        out_path = os.path.expandvars(out_path)
+
+    return out_path
+
+
+def resolve_file_path_list(pathlist, workdir, prefix='',
+                           randomize=False):
+    """Resolve the path of each file name in the file ``pathlist`` and
+    write the updated paths to a new file.
+    """
+    files = [line.strip() for line in open(pathlist, 'r')]
+    newfiles = []
+    for f in files:
+        f = os.path.expandvars(f)
+        if os.path.isfile(f):
+            newfiles += [f]
         else:
-            raise Exception('Wrong number of dimensions for Map object.')
+            newfiles += [os.path.join(workdir, f)]
 
-        self._width = \
-            np.array([np.abs(self.wcs.wcs.cdelt[0])*self._npix[xindex],
-                      np.abs(self.wcs.wcs.cdelt[1])*self._npix[yindex]])
-        self._pix_center = np.array([(self._npix[xindex]-1.0)/2.,
-                                     (self._npix[yindex]-1.0)/2.])
-        self._pix_size = np.array([np.abs(self.wcs.wcs.cdelt[0]),
-                                   np.abs(self.wcs.wcs.cdelt[1])])
+    if randomize:
+        _, tmppath = tempfile.mkstemp(prefix=prefix, dir=workdir)
+    else:
+        tmppath = os.path.join(workdir, prefix)
 
-        
-        self._skydir = SkyCoord.from_pixel(self._pix_center[0],
-                                           self._pix_center[1],
-                                           self.wcs)
-        
-    @property
-    def wcs(self):
-        return self._wcs
+    tmppath += '.txt'
 
-    @property
-    def skydir(self):
-        """Return the sky coordinate of the Map center."""
-        return self._skydir
+    with open(tmppath, 'w') as tmpfile:
+        tmpfile.write("\n".join(newfiles))
+    return tmppath
 
-    @property
-    def width(self):
-        """Return the sky coordinate of the Map center."""
-        return self._width
 
-    @property
-    def pix_size(self):
-        """Return the pixel size along the two image dimensions."""
-        return self._pix_size
+def is_fits_file(path):
 
-    @property
-    def pix_center(self):
-        """Return the ROI center in pixel coordinates."""
-        return self._pix_center
-    
-    @staticmethod
-    def create_from_hdu(hdu, wcs):
-        return Map(hdu.data.T, wcs)
+    if (path.endswith('.fit') or path.endswith('.fits') or
+            path.endswith('.fit.gz') or path.endswith('.fits.gz')):
+        return True
+    else:
+        return False
 
-    @staticmethod
-    def create_from_fits(fitsfile, **kwargs):
-        hdu = kwargs.get('hdu', 0)
 
-        hdulist = pyfits.open(fitsfile)
-        header = hdulist[hdu].header
-        data = hdulist[hdu].data
-        header = pyfits.Header.fromstring(header.tostring())
-        wcs = pywcs.WCS(header)
-        return Map(data, wcs)
+def collect_dirs(path, max_depth=1, followlinks=True):
+    """Recursively find directories under the given path."""
 
-    def create_image_hdu(self,name=None):
-        return pyfits.ImageHDU(self.counts,header=self.wcs.to_header(),
-                               name=name)
-    
-    def create_primary_hdu(self):
-        return pyfits.PrimaryHDU(self.counts,header=self.wcs.to_header())
-    
+    if not os.path.isdir(path):
+        return []
 
-    def sum_over_energy(self):
-        """ Reduce a 3D counts cube to a 2D counts map
-        """
-        # Note that the array is using the opposite convention from WCS
-        # so we sum over axis 0 in the array, but drop axis 2 in the WCS object
-        return Map(self.counts.sum(0),self.wcs.dropaxis(2))
+    o = [path]
 
-    def xy_pix_to_ipix(self,xypix,colwise=False):
-        """ Return the pixel index from the pixel xy coordinates 
+    if max_depth == 0:
+        return o
 
-        if colwise is True (False) this uses columnwise (rowwise) indexing
-        """
-        if colwise:
-            return xypix[0]*self._wcs._naxis2 + xypix[1]
-        else:
-            return xypix[1]*self._wcs._naxis1 + xypix[0]
-    
-    def ipix_to_xypix(self,ipix,colwise=False):
-        """ Return the pixel xy coordinates from the pixel index
+    for subdir in os.listdir(path):
 
-        if colwise is True (False) this uses columnwise (rowwise) indexing
-        """
-        if colwise:
-            return (ipix / self._wcs._naxis2, ipix % self._wcs._naxis2)
-        else:
-            return (ipix % self._wcs._naxis1, ipix / self._wcs._naxis1)
-    
-    def ipix_swap_axes(self,ipix,colwise=False):
-        """ Return the transposed pixel index from the pixel xy coordinates 
+        subdir = os.path.join(path, subdir)
 
-        if colwise is True (False) this assumes the original index was
-        in column wise scheme
-        """        
-        xy = self.ipix_to_xypix(ipix,colwise)
-        return self.xy_pix_to_ipix(xy,not colwise)
+        if not os.path.isdir(subdir):
+            continue
 
-    
-class PowerLaw(object):
-    def __init__(self, phi0, x0, index):
-        self._params = np.array([phi0, x0, index])
+        o += [subdir]
 
-    @property
-    def params(self):
-        return self._params
+        if os.path.islink(subdir) and not followlinks:
+            continue
 
-    def dfde(self, x):
-        return PowerLaw.eval_dfde(x, *self.params)
+        if max_depth > 0:
+            o += collect_dirs(subdir, max_depth=max_depth - 1)
 
-    @staticmethod
-    def eval_dfde(x, phi0, x0, index):
-        return phi0 * (x / x0) ** index
+    return list(set(o))
 
-    @staticmethod
-    def eval_flux(phi0, x0, index, xmin, xmax):
-        if np.allclose(index, -1.0):
-            return phi0 * x0 ** (-index) * (np.log(xmax) - np.log(xmin))
 
-        y0 = x0 * phi0 * (xmin / x0) ** (index + 1) / (index + 1)
-        y1 = x0 * phi0 * (xmax / x0) ** (index + 1) / (index + 1)
-        v = y1 - y0
+def match_regex_list(patterns, string):
+    """Perform a regex match of a string against a list of patterns.
+    Returns true if the string matches at least one pattern in the
+    list."""
 
-        return y1 - y0
+    for p in patterns:
 
-    @staticmethod
-    def eval_norm(x0, index, xmin, xmax, flux):
-        return flux / PowerLaw.eval_flux(1.0, x0, index, xmin, xmax)
+        if re.findall(p, string):
+            return True
 
-    
-def join_strings(strings,sep='_'):
+    return False
 
+
+def find_rows_by_string(tab, names, colnames=['assoc']):
+    """Find the rows in a table ``tab`` that match at least one of the
+    strings in ``names``.  This method ignores whitespace and case
+    when matching strings.
+
+    Parameters
+    ----------
+    tab : `astropy.table.Table`
+       Table that will be searched.
+
+    names : list
+       List of strings.
+
+    colname : str
+       Name of the table column that will be searched for matching string.
+
+    Returns
+    -------
+    mask : `~numpy.ndarray`
+       Boolean mask for rows with matching strings.
+
+    """
+    mask = np.empty(len(tab), dtype=bool)
+    mask.fill(False)
+    names = [name.lower().replace(' ', '') for name in names]
+
+    for colname in colnames:
+
+        if colname not in tab.columns:
+            continue
+
+        col = tab[[colname]].copy()
+        col[colname] = defchararray.replace(defchararray.lower(col[colname]),
+                                            ' ', '')
+        for name in names:
+            mask |= col[colname] == name
+    return mask
+
+
+def join_strings(strings, sep='_'):
     if strings is None:
         return ''
     else:
-        if not isinstance(strings,list):
-            strings = [strings]        
+        if not isinstance(strings, list):
+            strings = [strings]
         return sep.join([s for s in strings if s])
-        
+
+
 def format_filename(outdir, basename, prefix=None, extension=None):
     filename = join_strings(prefix)
-    filename = join_strings([filename,basename])
+    filename = join_strings([filename, basename])
 
     if extension is not None:
 
@@ -224,14 +259,24 @@ def format_filename(outdir, basename, prefix=None, extension=None):
     return os.path.join(outdir, filename)
 
 
+def strip_suffix(filename, suffix):
+    for s in suffix:
+        filename = re.sub(r'\.%s$' % s, '', filename)
+
+    return filename
+
+
+def met_to_mjd(time):
+    """"Convert mission elapsed time to mean julian date."""
+    return 54682.65 + (time - 239557414.0) / (86400.)
+
+
 RA_NGP = np.radians(192.8594812065348)
 DEC_NGP = np.radians(27.12825118085622)
 L_CP = np.radians(122.9319185680026)
 
+
 def gal2eq(l, b):
-    
-    global RA_NGP, DEC_NGP, L_CP
-    
     L_0 = L_CP - np.pi / 2.
     RA_0 = RA_NGP + np.pi / 2.
 
@@ -265,9 +310,6 @@ def gal2eq(l, b):
 
 
 def eq2gal(ra, dec):
-
-    global RA_NGP, DEC_NGP, L_CP
-    
     L_0 = L_CP - np.pi / 2.
     RA_0 = RA_NGP + np.pi / 2.
     DEC_0 = np.pi / 2. - DEC_NGP
@@ -332,8 +374,8 @@ def project(lon0, lat0, lon1, lat1):
     sinphi = np.sin(lon0)
 
     xyz = lonlat_to_xyz(lon1, lat1)
-    x1 = xyz[0];
-    y1 = xyz[1];
+    x1 = xyz[0]
+    y1 = xyz[1]
     z1 = xyz[2]
 
     x1p = x1 * costh * cosphi + y1 * costh * sinphi - z1 * sinth
@@ -346,14 +388,40 @@ def project(lon0, lat0, lon1, lat1):
     return r * np.cos(phi), r * np.sin(phi)
 
 
+def separation_cos_angle(lon0, lat0, lon1, lat1):
+    """Evaluate the cosine of the angular separation between two
+    direction vectors."""
+    return (np.sin(lat1) * np.sin(lat0) + np.cos(lat1) * np.cos(lat0) *
+            np.cos(lon1 - lon0))
+
+
+def dot_prod(xyz0, xyz1):
+    """Compute the dot product between two cartesian vectors where the
+    second dimension contains the vector components."""
+    return np.sum(xyz0 * xyz1, axis=1)
+
+
+def angle_to_cartesian(lon, lat):
+    """Convert spherical coordinates to cartesian unit vectors."""
+    theta = np.array(np.pi / 2. - lat)
+    return np.vstack((np.sin(theta) * np.cos(lon),
+                      np.sin(theta) * np.sin(lon),
+                      np.cos(theta))).T
+
+
 def scale_parameter(p):
-    if isinstance(p, str): p = float(p)
+    if isstr(p):
+        p = float(p)
 
     if p > 0:
         scale = 10 ** -np.round(np.log10(1. / p))
         return p / scale, scale
     else:
         return p, 1.0
+
+
+def update_bounds(val, bounds):
+    return min(val, bounds[0]), max(val, bounds[1])
 
 
 def apply_minmax_selection(val, val_minmax):
@@ -377,13 +445,19 @@ def apply_minmax_selection(val, val_minmax):
     return (min_cut and max_cut)
 
 
-def create_source_name(skydir):
+def create_source_name(skydir, floor=True, prefix='PS'):
     hms = skydir.icrs.ra.hms
     dms = skydir.icrs.dec.dms
-    return 'PS J%02.f%04.1f%+03.f%02.f' % (hms.h,
-                                           hms.m+hms.s/60.,
-                                           dms.d,
-                                           np.abs(dms.m+dms.s/60.))
+
+    if floor:
+        ra_ms = np.floor(10. * (hms.m + hms.s / 60.)) / 10.
+        dec_ms = np.floor(np.abs(dms.m + dms.s / 60.))
+    else:
+        ra_ms = (hms.m + hms.s / 60.)
+        dec_ms = np.abs(dms.m + dms.s / 60.)
+
+    return '%s J%02.f%04.1f%+03.f%02.f' % (prefix, hms.h, ra_ms,
+                                           dms.d, dec_ms)
 
 
 def create_model_name(src):
@@ -410,19 +484,151 @@ def create_model_name(src):
     if src['SpectrumType'] == 'PowerLaw':
         o += '_powerlaw_%04.2f' % float(src.spectral_pars['Index']['value'])
     else:
-        o += '_%s'%(src['SpectrumType'].lower())
-        
+        o += '_%s' % (src['SpectrumType'].lower())
+
     return o
 
 
-def cl_to_dlnl(cl):
-    """Compute the delta-log-likehood corresponding to an upper limit of
-    the given confidence level."""
+def cov_to_correlation(cov):
+    """Compute the correlation matrix given the covariance matrix.
+
+    Parameters
+    ----------
+    cov : `~numpy.ndarray`
+        N x N matrix of covariances among N parameters.
+
+    Returns
+    -------
+    corr : `~numpy.ndarray`
+        N x N matrix of correlations among N parameters.
+    """
+    err = np.sqrt(np.diag(cov))
+    errinv = np.ones_like(err) * np.nan
+    m = np.isfinite(err) & (err != 0)
+    errinv[m] = 1. / err[m]
+    corr = np.array(cov)
+    return corr * np.outer(errinv, errinv)
+
+
+def ellipse_to_cov(sigma_maj, sigma_min, theta):
+    """Compute the covariance matrix in two variables x and y given
+    the std. deviation along the semi-major and semi-minor axes and
+    the rotation angle of the error ellipse.
+
+    Parameters
+    ----------
+    sigma_maj : float
+        Std. deviation along major axis of error ellipse.
+
+    sigma_min : float
+        Std. deviation along minor axis of error ellipse.
+
+    theta : float
+        Rotation angle in radians from x-axis to ellipse major axis.
+    """
+    cth = np.cos(theta)
+    sth = np.sin(theta)
+    covxx = cth**2 * sigma_maj**2 + sth**2 * sigma_min**2
+    covyy = sth**2 * sigma_maj**2 + cth**2 * sigma_min**2
+    covxy = cth * sth * sigma_maj**2 - cth * sth * sigma_min**2
+    return np.array([[covxx, covxy], [covxy, covyy]])
+
+
+def twosided_cl_to_dlnl(cl):
+    """Compute the delta-loglikehood value that corresponds to a
+    two-sided interval of the given confidence level.
+
+    Parameters
+    ----------
+    cl : float
+        Confidence level.
+
+    Returns
+    -------
+    dlnl : float    
+        Delta-loglikelihood value with respect to the maximum of the
+        likelihood function.
+    """
+    return 0.5 * np.power(np.sqrt(2.) * special.erfinv(cl), 2)
+
+
+def twosided_dlnl_to_cl(dlnl):
+    """Compute the confidence level that corresponds to a two-sided
+    interval with a given change in the loglikelihood value.
+
+    Parameters
+    ----------
+    dlnl : float
+        Delta-loglikelihood value with respect to the maximum of the
+        likelihood function.
+
+    Returns
+    -------
+    cl : float
+        Confidence level.
+    """
+    return special.erf(dlnl**0.5)
+
+
+def onesided_cl_to_dlnl(cl):
+    """Compute the delta-loglikehood values that corresponds to an
+    upper limit of the given confidence level.
+
+    Parameters
+    ----------
+    cl : float
+        Confidence level.
+
+    Returns
+    -------
+    dlnl : float
+        Delta-loglikelihood value with respect to the maximum of the
+        likelihood function.
+    """
     alpha = 1.0 - cl
     return 0.5 * np.power(np.sqrt(2.) * special.erfinv(1 - 2 * alpha), 2.)
 
 
-def find_function_root(fn, x0, xb, delta = 0.0):    
+def onesided_dlnl_to_cl(dlnl):
+    """Compute the confidence level that corresponds to an upper limit
+    with a given change in the loglikelihood value.
+
+    Parameters
+    ----------
+    dlnl : float
+        Delta-loglikelihood value with respect to the maximum of the
+        likelihood function.
+
+    Returns
+    -------
+    cl : float
+        Confidence level.
+    """
+    alpha = (1.0 - special.erf(dlnl**0.5)) / 2.0
+    return 1.0 - alpha
+
+
+def interpolate_function_min(x, y):
+    sp = scipy.interpolate.splrep(x, y, k=2, s=0)
+
+    def fn(t):
+        return scipy.interpolate.splev(t, sp, der=1)
+
+    if np.sign(fn(x[0])) == np.sign(fn(x[-1])):
+
+        if np.sign(fn(x[0])) == -1:
+            return x[-1]
+        else:
+            return x[0]
+
+    x0 = scipy.optimize.brentq(fn,
+                               x[0], x[-1],
+                               xtol=1e-10 * np.median(x))
+
+    return x0
+
+
+def find_function_root(fn, x0, xb, delta=0.0):
     """Find the root of a function: f(x)+delta in the interval encompassed
     by x0 and xb.
 
@@ -445,7 +651,7 @@ def find_function_root(fn, x0, xb, delta = 0.0):
 
     if x0 == xb:
         return np.nan
-    
+
     for i in range(10):
         if np.sign(fn(xb) + delta) != np.sign(fn(x0) + delta):
             break
@@ -454,22 +660,27 @@ def find_function_root(fn, x0, xb, delta = 0.0):
             xb *= 0.5
         else:
             xb *= 2.0
-            
+
     # Failed to find a root
     if np.sign(fn(xb) + delta) == np.sign(fn(x0) + delta):
         return np.nan
 
     if x0 == 0:
-        xtol = 1e-10*xb
+        xtol = 1e-10 * xb
     else:
-        xtol = 1e-10*(xb+x0)
-            
-    return brentq(lambda t: fn(t)+delta,x0, xb, xtol=xtol)
+        xtol = 1e-10 * (xb + x0)
+
+    return brentq(lambda t: fn(t) + delta, x0, xb, xtol=xtol)
 
 
-def get_parameter_limits(xval, logLike, ul_confidence=0.95):
-    """Compute upper/lower limits, peak position, and 1-sigma errors from a
-    1-D likelihood function.
+def get_parameter_limits(xval, loglike, ul_confidence=0.95, tol=1E-3):
+    """Compute upper/lower limits, peak position, and 1-sigma errors
+    from a 1-D likelihood function.  This function uses the
+    delta-loglikelihood method to evaluate parameter limits by
+    searching for the point at which the change in the log-likelihood
+    value with respect to the maximum equals a specific value.  A
+    parabolic spline fit to the log-likelihood values is used to
+    improve the accuracy of the calculation.
 
     Parameters
     ----------
@@ -477,132 +688,266 @@ def get_parameter_limits(xval, logLike, ul_confidence=0.95):
     xval : `~numpy.ndarray`
        Array of parameter values.
 
-    logLike : `~numpy.ndarray`
+    loglike : `~numpy.ndarray`
        Array of log-likelihood values.
 
     ul_confidence : float
-       Confidence level to use for limit calculation.  
-    
+       Confidence level to use for limit calculation.
+
+    tol : float
+       Tolerance parameter for spline.
+
     """
 
-    deltalnl = cl_to_dlnl(ul_confidence)
-    
-    s = UnivariateSpline(xval, logLike, k=2, s=1E-4)
-    sd = s.derivative()
-        
-    imax = np.argmax(logLike)
-    ilo = max(imax-2,0)
-    ihi = min(imax+2,len(xval)-1)
-        
+    deltalnl = onesided_cl_to_dlnl(ul_confidence)
+
+    # EAC FIXME, added try block here b/c sometimes xval is np.nan
+    try:
+        spline = UnivariateSpline(xval, loglike, k=2, s=tol)
+    except:
+        print ("Failed to create spline: ", xval, loglike)
+        return {'x0': np.nan, 'ul': np.nan, 'll': np.nan,
+                'err_lo': np.nan, 'err_hi': np.nan, 'err': np.nan,
+                'lnlmax': np.nan}
+    # m = np.abs(loglike[1:] - loglike[:-1]) > delta_tol
+    # xval = np.concatenate((xval[:1],xval[1:][m]))
+    # loglike = np.concatenate((loglike[:1],loglike[1:][m]))
+    # spline = InterpolatedUnivariateSpline(xval, loglike, k=2)
+
+    sd = spline.derivative()
+
+    imax = np.argmax(loglike)
+    ilo = max(imax - 1, 0)
+    ihi = min(imax + 1, len(xval) - 1)
+
     # Find the peak
-    x0 = xval[imax]        
+    x0 = xval[imax]
 
     # Refine the peak position
     if np.sign(sd(xval[ilo])) != np.sign(sd(xval[ihi])):
         x0 = find_function_root(sd, xval[ilo], xval[ihi])
-                
-    lnlmax = float(s(x0))
 
-    fn = lambda t: s(t)-lnlmax
-    ul = find_function_root(fn,x0,xval[-1],deltalnl)
-    ll = find_function_root(fn,x0,xval[0],deltalnl)
-    err_lo = np.abs(x0 - find_function_root(fn,x0,xval[0],0.5))
-    err_hi = np.abs(x0 - find_function_root(fn,x0,xval[-1],0.5))
-    
+    lnlmax = float(spline(x0))
+
+    fn = lambda t: spline(t) - lnlmax
+    fn_val = fn(xval)
+    if np.any(fn_val[imax:] < -deltalnl):
+        xhi = xval[imax:][fn_val[imax:] < -deltalnl][0]
+    else:
+        xhi = xval[-1]
+
+    if np.any(fn_val[:imax] < -deltalnl):
+        xlo = xval[:imax][fn_val[:imax] < -deltalnl][-1]
+    else:
+        xlo = xval[0]
+
+    ul = find_function_root(fn, x0, xhi, deltalnl)
+    ll = find_function_root(fn, x0, xlo, deltalnl)
+    err_lo = np.abs(x0 - find_function_root(fn, x0, xlo, 0.5))
+    err_hi = np.abs(x0 - find_function_root(fn, x0, xhi, 0.5))
+
     if np.isfinite(err_lo):
-        err = 0.5*(err_lo+err_hi)
+        err = 0.5 * (err_lo + err_hi)
     else:
         err = err_hi
-        
-    o = {'x0' : x0, 'ul' : ul, 'll' : ll,
-         'err_lo' : err_lo, 'err_hi' : err_hi, 'err' : err,
-         'lnlmax' : lnlmax }
+
+    o = {'x0': x0, 'ul': ul, 'll': ll,
+         'err_lo': err_lo, 'err_hi': err_hi, 'err': err,
+         'lnlmax': lnlmax}
     return o
-    
+
 
 def poly_to_parabola(coeff):
-
-    sigma = np.sqrt(1./np.abs(2.0*coeff[0]))
-    x0 = -coeff[1]/(2*coeff[0])
-    y0 = (1.-(coeff[1]**2-4*coeff[0]*coeff[2]))/(4*coeff[0])
+    sigma = np.sqrt(1. / np.abs(2.0 * coeff[0]))
+    x0 = -coeff[1] / (2 * coeff[0])
+    y0 = (1. - (coeff[1] ** 2 - 4 * coeff[0] * coeff[2])) / (4 * coeff[0])
 
     return x0, sigma, y0
 
 
-def parabola((x, y), amplitude, x0, y0, sx, sy, theta):
+def parabola(xy, amplitude, x0, y0, sx, sy, theta):
+    """Evaluate a 2D parabola given by:
+
+    f(x,y) = f_0 - (1/2) * \delta^T * R * \Sigma * R^T * \delta
+
+    where
+
+    \delta = [(x - x_0), (y - y_0)]
+
+    and R is the matrix for a 2D rotation by angle \theta and \Sigma
+    is the covariance matrix:
+
+    \Sigma = [[1/\sigma_x^2, 0           ],
+              [0           , 1/\sigma_y^2]] 
+
+    Parameters
+    ----------
+    xy : tuple    
+       Tuple containing x and y arrays for the values at which the
+       parabola will be evaluated.
+
+    amplitude : float
+       Constant offset value.
+
+    x0 : float
+       Centroid in x coordinate.
+
+    y0 : float
+       Centroid in y coordinate.
+
+    sx : float
+       Standard deviation along first axis (x-axis when theta=0).
+
+    sy : float
+       Standard deviation along second axis (y-axis when theta=0).
+
+    theta : float
+       Rotation angle in radians.
+
+    Returns
+    -------
+    vals : `~numpy.ndarray`    
+       Values of the parabola evaluated at the points defined in the
+       `xy` input tuple.
+
+    """
+
+    x = xy[0]
+    y = xy[1]
+
     cth = np.cos(theta)
     sth = np.sin(theta)
     a = (cth ** 2) / (2 * sx ** 2) + (sth ** 2) / (2 * sy ** 2)
     b = -(np.sin(2 * theta)) / (4 * sx ** 2) + (np.sin(2 * theta)) / (
         4 * sy ** 2)
     c = (sth ** 2) / (2 * sx ** 2) + (cth ** 2) / (2 * sy ** 2)
-    v = amplitude - (a * ((x - x0) ** 2) +
-                     2 * b * (x - x0) * (y - y0) +
-                     c * ((y - y0) ** 2))
+    vals = amplitude - (a * ((x - x0) ** 2) +
+                        2 * b * (x - x0) * (y - y0) +
+                        c * ((y - y0) ** 2))
 
-    return np.ravel(v)
+    return vals
 
 
-def fit_parabola(z,ix,iy,dpix=2,zmin=None):
+def fit_parabola(z, ix, iy, dpix=3, zmin=None):
+    """Fit a parabola to a 2D numpy array.  This function will fit a
+    parabola with the functional form described in
+    `~fermipy.utils.parabola` to a 2D slice of the input array `z`.
+    The fit region encompasses pixels that are within `dpix` of the
+    pixel coordinate (iz,iy) OR that have a value relative to the peak
+    value greater than `zmin`.
 
-    import scipy.optimize
-    xmin = max(0,ix-dpix)
-    xmax = min(z.shape[0],ix+dpix+1)
+    Parameters
+    ----------
+    z : `~numpy.ndarray`
 
-    ymin = max(0,iy-dpix)
-    ymax = min(z.shape[1],iy+dpix+1)
-    
-    sx = slice(xmin,xmax)
-    sy = slice(ymin,ymax)
+    ix : int
+       X index of center pixel of fit region in array `z`.
 
-    nx = sx.stop-sx.start
-    ny = sy.stop-sy.start
-    
-    x = np.arange(sx.start,sx.stop)
-    y = np.arange(sy.start,sy.stop)
+    iy : int
+       Y index of center pixel of fit region in array `z`.
 
-    x = x[:,np.newaxis]*np.ones((nx,ny))
-    y = y[np.newaxis,:]*np.ones((nx,ny))
-        
-    coeffx = poly_to_parabola(np.polyfit(np.arange(sx.start,sx.stop),z[sx,iy],2))
-    coeffy = poly_to_parabola(np.polyfit(np.arange(sy.start,sy.stop),z[ix,sy],2))
-    p0 = [coeffx[2], coeffx[0], coeffy[0], coeffx[1], coeffy[1], 0.0]
-    m = np.isfinite(z[sx,sy])
+    dpix : int
+       Max distance from center pixel of fit region.
+
+    zmin : float
+
+    """
+    offset = make_pixel_distance(z.shape, iy, ix)
+    x, y = np.meshgrid(np.arange(z.shape[0]), np.arange(z.shape[1]),
+                       indexing='ij')
+
+    m = (offset <= dpix)
+    #m = (np.abs(x-ix) <= dpix) & (np.abs(y-iy) <= dpix)
     if zmin is not None:
-        m = z[sx,sy] > zmin
+        mz = (z - np.max(z[m]) > zmin)
+        labels = label(mz)[0]
+        mz &= labels == labels[ix, iy]
+        m |= mz
 
-    o = { 'fit_success': True, 'p0' : p0 }
-    
+    mx = np.abs(x[:, iy] - ix) <= dpix
+    my = np.abs(y[ix, :] - iy) <= dpix
+
+    coeffx = poly_to_parabola(np.polyfit(x[:, iy][mx],
+                                         z[:, iy][mx], 2))
+    coeffy = poly_to_parabola(np.polyfit(y[ix, :][my],
+                                         z[ix, :][my], 2))
+    p0 = [coeffx[2], coeffx[0], coeffy[0], coeffx[1], coeffy[1], 0.0]
+
+    o = {'fit_success': True, 'p0': p0}
+
+    def curve_fit_fn(*args):
+        return np.ravel(parabola(*args))
+
     try:
-        popt, pcov = scipy.optimize.curve_fit(parabola,
-                                              (np.ravel(x[m]),np.ravel(y[m])),
-                                              np.ravel(z[sx,sy][m]), p0)
+        popt, pcov = scipy.optimize.curve_fit(curve_fit_fn,
+                                              (np.ravel(x[m]), np.ravel(y[m])),
+                                              np.ravel(z[m]), p0)
     except Exception:
         popt = copy.deepcopy(p0)
         o['fit_success'] = False
-#        self.logger.error('Localization failed.', exc_info=True)
-        
-    fm = parabola((x[m],y[m]),*popt)
-    df = fm - z[sx,sy][m].flat
-    rchi2 = np.sum(df**2)/len(fm)
-        
+
+    fm = parabola((x[m], y[m]), *popt)
+    df = fm - z[m]
+    rchi2 = np.sum(df ** 2) / len(fm)
+
     o['rchi2'] = rchi2
     o['x0'] = popt[1]
     o['y0'] = popt[2]
-    o['sigmax'] = popt[3]
-    o['sigmay'] = popt[4]
-    o['sigma'] = np.sqrt(o['sigmax']**2 + o['sigmay']**2)
+    o['sigmax'] = np.abs(popt[3])
+    o['sigmay'] = np.abs(popt[4])
+    o['sigma'] = np.sqrt(o['sigmax'] ** 2 + o['sigmay'] ** 2)
     o['z0'] = popt[0]
     o['theta'] = popt[5]
     o['popt'] = popt
+    o['mask'] = m
 
-    a = max(o['sigmax'],o['sigmay'])
-    b = min(o['sigmax'],o['sigmay'])
-    
-    o['eccentricity'] = np.sqrt(1-b**2/a**2)
-    o['eccentricity2'] = np.sqrt(a**2/b**2-1)
-    
+    a = max(o['sigmax'], o['sigmay'])
+    b = min(o['sigmax'], o['sigmay'])
+
+    o['eccentricity'] = np.sqrt(1 - b ** 2 / a ** 2)
+    o['eccentricity2'] = np.sqrt(a ** 2 / b ** 2 - 1)
+
     return o
+
+
+def split_bin_edges(edges, npts=2):
+    """Subdivide an array of bins by splitting each bin into ``npts``
+    subintervals.
+
+    Parameters
+    ----------
+    edges : `~numpy.ndarray`
+        Bin edge array.
+
+    npts : int
+        Number of intervals into which each bin will be subdivided.
+
+    Returns
+    -------
+    edges : `~numpy.ndarray`
+        Subdivided bin edge array.
+
+    """
+    if npts < 2:
+        return edges
+
+    x = (edges[:-1, None] +
+         (edges[1:, None] - edges[:-1, None]) *
+         np.linspace(0.0, 1.0, npts + 1)[None, :])
+    return np.unique(np.ravel(x))
+
+
+def center_to_edge(center):
+
+    if len(center) == 1:
+        delta = np.array(1.0, ndmin=1)
+    else:
+        delta = center[1:] - center[:-1]
+
+    edges = 0.5 * (center[1:] + center[:-1])
+    edges = np.insert(edges, 0, center[0] - 0.5 * delta[0])
+    edges = np.append(edges, center[-1] + 0.5 * delta[-1])
+    return edges
 
 
 def edge_to_center(edges):
@@ -617,6 +962,10 @@ def val_to_bin(edges, x):
     """Convert axis coordinate to bin index."""
     ibin = np.digitize(np.array(x, ndmin=1), edges) - 1
     return ibin
+
+
+def val_to_pix(center, x):
+    return np.interp(x, center, np.arange(len(center)).astype(float))
 
 
 def val_to_edge(edges, x):
@@ -638,23 +987,23 @@ def val_to_bin_bounded(edges, x):
     return ibin
 
 
-def extend_array(edges,binsz,lo,hi):
+def extend_array(edges, binsz, lo, hi):
     """Extend an array to encompass lo and hi values."""
-    
-    numlo = int(np.ceil((edges[0]-lo)/binsz))
-    numhi = int(np.ceil((hi-edges[-1])/binsz))
+
+    numlo = int(np.ceil((edges[0] - lo) / binsz))
+    numhi = int(np.ceil((hi - edges[-1]) / binsz))
 
     edges = copy.deepcopy(edges)
     if numlo > 0:
-        edges_lo = np.linspace(edges[0]-numlo*binsz, edges[0], numlo+1)
-        edges = np.concatenate((edges_lo[:-1],edges))
-        
+        edges_lo = np.linspace(edges[0] - numlo * binsz, edges[0], numlo + 1)
+        edges = np.concatenate((edges_lo[:-1], edges))
+
     if numhi > 0:
-        edges_hi = np.linspace(edges[-1],edges[-1]+numhi*binsz,numhi+1)
-        edges = np.concatenate((edges,edges_hi[1:]))
+        edges_hi = np.linspace(edges[-1], edges[-1] + numhi * binsz, numhi + 1)
+        edges = np.concatenate((edges, edges_hi[1:]))
 
     return edges
-        
+
 
 def mkdir(dir):
     if not os.path.exists(dir):
@@ -682,24 +1031,58 @@ def fits_recarray_to_dict(table):
         elif type(col_data[0]) == np.ndarray:
             cols[col] = np.array(col_data)
         else:
-            print col, col_data
             raise Exception(
                 'Unrecognized column type: %s %s' % (col, str(type(col_data))))
 
     return cols
 
 
+def unicode_to_str(args):
+    o = {}
+    for k, v in args.items():
+        if isinstance(v, unicode):
+            o[k] = str(v)
+        else:
+            o[k] = v
+
+    return o
+
+
+def isstr(s):
+    """String instance testing method that works under both Python 2.X
+    and 3.X.  Returns true if the input is a string."""
+
+    try:
+        return isinstance(s, basestring)
+    except NameError:
+        return isinstance(s, str)
+
+
+def xmlpath_to_path(path):
+    if path is None:
+        return path
+
+    return re.sub(r'\$\(([a-zA-Z\_]+)\)', r'$\1', path)
+
+
+def path_to_xmlpath(path):
+    if path is None:
+        return path
+
+    return re.sub(r'\$([a-zA-Z\_]+)', r'$(\1)', path)
+
+
 def create_xml_element(root, name, attrib):
     el = et.SubElement(root, name)
     for k, v in attrib.iteritems():
 
-        if isinstance(v,bool):
-            el.set(k,str(int(v)))
-        elif isinstance(v,str):
-             el.set(k, v)
-        elif np.isfinite(v):        
+        if isinstance(v, bool):
+            el.set(k, str(int(v)))
+        elif isstr(v):
+            el.set(k, v)
+        elif np.isfinite(v):
             el.set(k, str(v))
-            
+
     return el
 
 
@@ -725,14 +1108,54 @@ def prettify_xml(elem):
     return reparsed.toprettyxml(indent="  ")
 
 
+def arg_to_list(arg):
+    if arg is None:
+        return []
+    elif isinstance(arg, list):
+        return arg
+    else:
+        return [arg]
+
+
+def update_keys(input_dict, key_map):
+    o = {}
+    for k, v in input_dict.items():
+
+        if k in key_map.keys():
+            k = key_map[k]
+
+        if isinstance(v, dict):
+            o[k] = update_keys(v, key_map)
+        else:
+            o[k] = v
+
+    return o
+
+
+def create_dict(d0, **kwargs):
+    o = copy.deepcopy(d0)
+    o = merge_dict(o, kwargs, add_new_keys=True)
+    return o
+
+
 def merge_dict(d0, d1, add_new_keys=False, append_arrays=False):
     """Recursively merge the contents of python dictionary d0 with
     the contents of another python dictionary, d1.
 
-    add_new_keys : Do not skip keys that only exist in d1.
+    Parameters
+    ----------
+    d0 : dict
+       The input dictionary.
 
-    append_arrays : If an element is a numpy array set the value of
-    that element by concatenating the two arrays.
+    d1 : dict
+       Dictionary to be merged with the input dictionary.
+
+    add_new_keys : str
+       Do not skip keys that only exist in d1.
+
+    append_arrays : bool
+       If an element is a numpy array set the value of that element by
+       concatenating the two arrays.
     """
 
     if d1 is None:
@@ -758,8 +1181,10 @@ def merge_dict(d0, d1, add_new_keys=False, append_arrays=False):
             od[k] = copy.deepcopy(d0[k])
         elif isinstance(v, dict) and isinstance(d1[k], dict):
             od[k] = merge_dict(d0[k], d1[k], add_new_keys, append_arrays)
-        elif isinstance(v, list) and isinstance(d1[k], str):
+        elif isinstance(v, list) and isstr(d1[k]):
             od[k] = d1[k].split(',')
+        elif isinstance(v, dict) and d1[k] is None:
+            od[k] = copy.deepcopy(d0[k])
         elif isinstance(v, np.ndarray) and append_arrays:
             od[k] = np.concatenate((v, d1[k]))
         elif (d0[k] is not None and d1[k] is not None) and t0 != t1:
@@ -772,7 +1197,7 @@ def merge_dict(d0, d1, add_new_keys=False, append_arrays=False):
             od[k] = copy.copy(d1[k])
 
     if add_new_keys:
-        for k, v in d1.iteritems():
+        for k, v in d1.items():
             if k not in d0:
                 od[k] = copy.deepcopy(d1[k])
 
@@ -849,98 +1274,13 @@ def tolist(x):
         return x
 
 
-def extract_mapcube_region(infile, skydir, outfile, maphdu=0):
-    """Extract a region out of an all-sky mapcube file.
-
-    Parameters
-    ----------
-
-    infile : str
-        Path to mapcube file.
-    
-    skydir : `~astropy.coordinates.SkyCoord`
-
-    """
-
-    h = pyfits.open(os.path.expandvars(infile))
-
-    npix = 200
-    shape = list(h[maphdu].data.shape)
-    shape[1] = 200
-    shape[2] = 200
-
-    wcs = pywcs.WCS(h[maphdu].header)
-    skywcs = pywcs.WCS(h[maphdu].header, naxis=[1, 2])
-    coordsys = get_coordsys(skywcs)
-
-    region_wcs = wcs.deepcopy()
-
-    if coordsys == 'CEL':
-        region_wcs.wcs.crval[0] = skydir.ra.deg
-        region_wcs.wcs.crval[1] = skydir.dec.deg
-    elif coordsys == 'GAL':
-        region_wcs.wcs.crval[0] = skydir.galactic.l.deg
-        region_wcs.wcs.crval[1] = skydir.galactic.b.deg
-    else:
-        raise Exception('Unrecognized coordinate system.')
-
-    region_wcs.wcs.crpix[0] = npix // 2 + 0.5
-    region_wcs.wcs.crpix[1] = npix // 2 + 0.5
-
-    from reproject import reproject_interp
-    data, footprint = reproject_interp(h, region_wcs.to_header(), hdu_in=maphdu,
-                                       shape_out=shape)
-
-    hdu_image = pyfits.PrimaryHDU(data, header=region_wcs.to_header())
-    hdulist = pyfits.HDUList([hdu_image, h['ENERGIES']])
-    hdulist.writeto(outfile, clobber=True)
-
-
-def create_wcs(skydir, coordsys='CEL', projection='AIT',
-               cdelt=1.0, crpix=1., naxis=2, energies=None):
-    """Create a WCS object.
-
-    Parameters
-    ----------
-
-    skydir : `~astropy.coordinates.SkyCoord`
-        Sky coordinate of the WCS reference point.
-
-    """
-
-    w = pywcs.WCS(naxis=naxis)
-
-    if coordsys == 'CEL':
-        w.wcs.ctype[0] = 'RA---%s' % (projection)
-        w.wcs.ctype[1] = 'DEC--%s' % (projection)
-        w.wcs.crval[0] = skydir.icrs.ra.deg
-        w.wcs.crval[1] = skydir.icrs.dec.deg
-    elif coordsys == 'GAL':
-        w.wcs.ctype[0] = 'GLON-%s' % (projection)
-        w.wcs.ctype[1] = 'GLAT-%s' % (projection)
-        w.wcs.crval[0] = skydir.galactic.l.deg
-        w.wcs.crval[1] = skydir.galactic.b.deg
-    else:
-        raise Exception('Unrecognized coordinate system.')
-
-    w.wcs.crpix[0] = crpix
-    w.wcs.crpix[1] = crpix
-    w.wcs.cdelt[0] = -cdelt
-    w.wcs.cdelt[1] = cdelt
-
-    w = pywcs.WCS(w.to_header())
-    if naxis == 3 and energies is not None:
-        w.wcs.crpix[2] = 1
-        w.wcs.crval[2] = 10 ** energies[0]
-        w.wcs.cdelt[2] = 10 ** energies[1] - 10 ** energies[0]
-        w.wcs.ctype[2] = 'Energy'
-
-    return w
-
-
 def create_hpx_disk_region_string(skyDir, coordsys, radius, inclusive=0):
     """
     """
+    # Make an all-sky region
+    if radius >= 90.:
+        return None
+
     if coordsys == "GAL":
         xref = skyDir.galactic.l.deg
         yref = skyDir.galactic.b.deg
@@ -955,124 +1295,6 @@ def create_hpx_disk_region_string(skyDir, coordsys, radius, inclusive=0):
     else:
         val = "DISK(%.3f,%.3f,%.3f)" % (xref, yref, radius)
     return val
-
-
-def get_coordsys(wcs):
-    if 'RA' in wcs.wcs.ctype[0]:
-        return 'CEL'
-    elif 'GLON' in wcs.wcs.ctype[0]:
-        return 'GAL'
-    else:
-        raise Exception('Unrecognized WCS coordinate system.')
-
-
-def skydir_to_pix(skydir, wcs):
-    """Convert skydir object to pixel coordinates."""
-
-    if 'RA' in wcs.wcs.ctype[0]:
-        xpix, ypix = wcs.wcs_world2pix(skydir.ra.deg, skydir.dec.deg, 0)
-    elif 'GLON' in wcs.wcs.ctype[0]:
-        xpix, ypix = wcs.wcs_world2pix(skydir.galactic.l.deg,
-                                       skydir.galactic.b.deg, 0)
-    else:
-        raise Exception('Unrecognized WCS coordinate system.')
-
-    return [xpix, ypix]
-
-
-def pix_to_skydir(xpix, ypix, wcs):
-    """Convert pixel coordinates to a skydir object."""
-
-    if 'RA' in wcs.wcs.ctype[0]:
-        ra, dec = wcs.wcs_pix2world(xpix, ypix, 0)
-        return SkyCoord(ra, dec, unit=u.deg)
-    elif 'GLON' in wcs.wcs.ctype[0]:
-        glon, glat = wcs.wcs_pix2world(xpix, ypix, 0)
-        return SkyCoord(glon, glat, unit=u.deg,
-                        frame='galactic').transform_to('icrs')
-    else:
-        raise Exception('Unrecognized WCS coordinate system.')
-
-
-def offset_to_sky(skydir, offset_lon, offset_lat,
-                  coordsys='CEL', projection='AIT'):
-    """Convert a cartesian offset (X,Y) in the given projection into
-    a spherical coordinate."""
-
-    offset_lon = np.array(offset_lon, ndmin=1)
-    offset_lat = np.array(offset_lat, ndmin=1)
-
-    w = create_wcs(skydir, coordsys, projection)
-    pixcrd = np.vstack((offset_lon, offset_lat)).T
-
-    return w.wcs_pix2world(pixcrd, 0)
-
-
-def offset_to_skydir(skydir, offset_lon, offset_lat,
-                     coordsys='CEL', projection='AIT'):
-    """Convert a cartesian offset (X,Y) in the given projection into
-    a spherical coordinate."""
-
-    offset_lon = np.array(offset_lon, ndmin=1)
-    offset_lat = np.array(offset_lat, ndmin=1)
-
-    w = create_wcs(skydir, coordsys, projection)
-    return SkyCoord.from_pixel(offset_lon, offset_lat, w, 0)
-
-
-def sky_to_offset(skydir, lon, lat, coordsys='CEL', projection='AIT'):
-    """Convert sky coordinates to a projected offset.  This function
-    is the inverse of offset_to_sky."""
-    
-    w = create_wcs(skydir, coordsys, projection)
-    skycrd = np.vstack((lon, lat)).T
-    
-    if len(skycrd) == 0:
-        return skycrd
-    
-    return w.wcs_world2pix(skycrd, 0)
-
-
-def get_target_skydir(config,ref_skydir=None):
-
-    if ref_skydir is None:
-        ref_skydir = SkyCoord(0.0,0.0,unit=u.deg)
-    
-    radec = config.get('radec', None)
-
-    if isinstance(radec, str):
-        return SkyCoord(radec, unit=u.deg)
-    elif isinstance(radec, list):
-        return SkyCoord(radec[0], radec[1], unit=u.deg)
-
-    ra = config.get('ra', None)
-    dec = config.get('dec', None)
-
-    if ra is not None and dec is not None:
-        return SkyCoord(ra, dec, unit=u.deg)
-
-    glon = config.get('glon', None)
-    glat = config.get('glat', None)
-
-    if glon is not None and glat is not None:
-        return SkyCoord(glon, glat, unit=u.deg,
-                        frame='galactic').transform_to('icrs')
-
-    offset_ra = config.get('offset_ra', None)
-    offset_dec = config.get('offset_dec', None)
-    
-    if offset_ra is not None and offset_dec is not None:
-        return offset_to_skydir(ref_skydir, offset_ra, offset_dec,
-                                coordsys='CEL')[0]
-
-    offset_glon = config.get('offset_glon', None)
-    offset_glat = config.get('offset_glat', None)
-    
-    if offset_glon is not None and offset_glat is not None:
-        return offset_to_skydir(ref_skydir, offset_glon, offset_glat,
-                                coordsys='GAL')[0]
-        
-    return ref_skydir
 
 
 def convolve2d_disk(fn, r, sig, nstep=200):
@@ -1106,9 +1328,8 @@ def convolve2d_disk(fn, r, sig, nstep=200):
     rmin[rmin < 0] = 0
     delta = (rmax - rmin) / nstep
 
-    redge = rmin[:, np.newaxis] + delta[:, np.newaxis] * np.linspace(0, nstep,
-                                                                     nstep + 1)[
-                                                         np.newaxis, :]
+    redge = rmin[:, np.newaxis] + \
+        delta[:, np.newaxis] * np.linspace(0, nstep, nstep + 1)[np.newaxis, :]
     rp = 0.5 * (redge[:, 1:] + redge[:, :-1])
     dr = redge[:, 1:] - redge[:, :-1]
     fnv = fn(rp)
@@ -1132,7 +1353,7 @@ def convolve2d_disk(fn, r, sig, nstep=200):
 def convolve2d_gauss(fn, r, sig, nstep=200):
     """Evaluate the convolution f'(r) = f(r) * g(r) where f(r) is
     azimuthally symmetric function in two dimensions and g is a
-    gaussian given by:
+    2D gaussian with standard deviation s given by:
 
     g(r) = 1/(2*pi*s^2) Exp[-r^2/(2*s^2)]
 
@@ -1177,112 +1398,124 @@ def convolve2d_gauss(fn, r, sig, nstep=200):
     if 'je_fn' not in convolve2d_gauss.__dict__:
         t = 10 ** np.linspace(-8, 8, 1000)
         t = np.insert(t, 0, [0])
-        je = specialfn.ive(0, t)
+        je = special.ive(0, t)
         convolve2d_gauss.je_fn = UnivariateSpline(t, je, k=2, s=0)
 
     je = convolve2d_gauss.je_fn(x.flat).reshape(x.shape)
-    #    je2 = specialfn.ive(0,x)
-    v = (
-    rp * fnv / (sig2) * je * np.exp(x - (r * r + rp * rp) / (2 * sig2)) * dr)
+    #    je2 = special.ive(0,x)
+    v = (rp * fnv / (sig2) * je * np.exp(x - (r * r + rp * rp) /
+                                         (2 * sig2)) * dr)
     s = np.sum(v, axis=saxis)
 
     return s
 
 
-def make_pixel_offset(npix, xpix=0.0, ypix=0.0):
-    """Make a 2D array with the distance of each pixel from a
-    reference direction in pixel coordinates.  Pixel coordinates are
-    defined such that (0,0) is located at the center of the coordinate
-    grid."""
+def make_pixel_distance(shape, xpix=None, ypix=None):
+    """Fill a 2D array with dimensions `shape` with the distance of each
+    pixel from a reference direction (xpix,ypix) in pixel coordinates.
+    Pixel coordinates are defined such that (0,0) is located at the
+    center of the corner pixel.
 
-    dx = np.abs(np.linspace(0, npix - 1, npix) - (npix - 1) / 2. - xpix)
-    dy = np.abs(np.linspace(0, npix - 1, npix) - (npix - 1) / 2. - ypix)
-    dxy = np.zeros((npix, npix))
+    """
+    if np.isscalar(shape):
+        shape = [shape, shape]
+
+    if xpix is None:
+        xpix = (shape[1] - 1.0) / 2.
+
+    if ypix is None:
+        ypix = (shape[0] - 1.0) / 2.
+
+    dx = np.linspace(0, shape[1] - 1, shape[1]) - xpix
+    dy = np.linspace(0, shape[0] - 1, shape[0]) - ypix
+    dxy = np.zeros(shape)
     dxy += np.sqrt(dx[np.newaxis, :] ** 2 + dy[:, np.newaxis] ** 2)
 
     return dxy
 
 
-def make_gaussian_kernel(sigma, npix=501, cdelt=0.01, xpix=0.0, ypix=0.0):
+def make_gaussian_kernel(sigma, npix=501, cdelt=0.01, xpix=None, ypix=None):
     """Make kernel for a 2D gaussian.
 
     Parameters
     ----------
 
     sigma : float
-      68% containment radius in degrees.
+      Standard deviation in degrees.
     """
 
-    sigma /= 1.5095921854516636
     sigma /= cdelt
-
     fn = lambda t, s: 1. / (2 * np.pi * s ** 2) * np.exp(
         -t ** 2 / (s ** 2 * 2.0))
-    dxy = make_pixel_offset(npix, xpix, ypix)
+    dxy = make_pixel_distance(npix, xpix, ypix)
     k = fn(dxy, sigma)
     k /= (np.sum(k) * np.radians(cdelt) ** 2)
 
     return k
 
 
-def make_disk_kernel(sigma, npix=501, cdelt=0.01, xpix=0.0, ypix=0.0):
+def make_disk_kernel(radius, npix=501, cdelt=0.01, xpix=None, ypix=None):
     """Make kernel for a 2D disk.
-    
+
     Parameters
     ----------
 
-    sigma : float
+    radius : float
       Disk radius in deg.
     """
 
-    sigma /= cdelt
+    radius /= cdelt
     fn = lambda t, s: 0.5 * (np.sign(s - t) + 1.0)
 
-    dxy = make_pixel_offset(npix, xpix, ypix)
-    k = fn(dxy, sigma)
+    dxy = make_pixel_distance(npix, xpix, ypix)
+    k = fn(dxy, radius)
     k /= (np.sum(k) * np.radians(cdelt) ** 2)
 
     return k
 
 
-def make_cdisk_kernel(psf, sigma, npix, cdelt, xpix, ypix, normalize=False):
+def make_cdisk_kernel(psf, sigma, npix, cdelt, xpix, ypix, psf_scale_fn=None,
+                      normalize=False):
     """Make a kernel for a PSF-convolved 2D disk.
 
     Parameters
     ----------
 
     psf : `~fermipy.irfs.PSFModel`
-    
+
     sigma : float
       68% containment radius in degrees.
     """
 
+    sigma /= 0.8246211251235321
+
     dtheta = psf.dtheta
     egy = psf.energies
 
-    x = make_pixel_offset(npix, xpix, ypix)
+    x = make_pixel_distance(npix, xpix, ypix)
     x *= cdelt
 
     k = np.zeros((len(egy), npix, npix))
     for i in range(len(egy)):
-        fn = lambda t: 10 ** np.interp(t, dtheta, np.log10(psf.val[:, i]))
+        fn = lambda t: psf.eval(i, t, scale_fn=psf_scale_fn)
         psfc = convolve2d_disk(fn, dtheta, sigma)
         k[i] = np.interp(np.ravel(x), dtheta, psfc).reshape(x.shape)
 
     if normalize:
-        k /= (np.sum(k,axis=0)[np.newaxis,...] * np.radians(cdelt) ** 2)
-        
+        k /= (np.sum(k, axis=0)[np.newaxis, ...] * np.radians(cdelt) ** 2)
+
     return k
 
 
-def make_cgauss_kernel(psf, sigma, npix, cdelt, xpix, ypix, normalize=False):
+def make_cgauss_kernel(psf, sigma, npix, cdelt, xpix, ypix, psf_scale_fn=None,
+                       normalize=False):
     """Make a kernel for a PSF-convolved 2D gaussian.
 
     Parameters
     ----------
 
     psf : `~fermipy.irfs.PSFModel`
-    
+
     sigma : float
       68% containment radius in degrees.
     """
@@ -1292,25 +1525,149 @@ def make_cgauss_kernel(psf, sigma, npix, cdelt, xpix, ypix, normalize=False):
     dtheta = psf.dtheta
     egy = psf.energies
 
-    x = make_pixel_offset(npix, xpix, ypix)
+    x = make_pixel_distance(npix, xpix, ypix)
     x *= cdelt
 
     k = np.zeros((len(egy), npix, npix))
-
-    logpsf = np.log10(psf.val)
-    
     for i in range(len(egy)):
-        fn = lambda t: 10 ** np.interp(t, dtheta, logpsf[:, i])
+        fn = lambda t: psf.eval(i, t, scale_fn=psf_scale_fn)
         psfc = convolve2d_gauss(fn, dtheta, sigma)
         k[i] = np.interp(np.ravel(x), dtheta, psfc).reshape(x.shape)
 
     if normalize:
-        k /= (np.sum(k,axis=0)[np.newaxis,...] * np.radians(cdelt) ** 2)
+        k /= (np.sum(k, axis=0)[np.newaxis, ...] * np.radians(cdelt) ** 2)
 
     return k
 
 
-def make_psf_kernel(psf, npix, cdelt, xpix, ypix, normalize=False):
+def memoize(obj):
+    obj.cache = {}
+
+    @functools.wraps(obj)
+    def memoizer(*args, **kwargs):
+        key = str(args) + str(kwargs)
+        if key not in obj.cache:
+            obj.cache = {}
+            obj.cache[key] = obj(*args, **kwargs)
+        return obj.cache[key]
+    return memoizer
+
+
+def make_radial_kernel(psf, fn, sigma, npix, cdelt, xpix, ypix, psf_scale_fn=None,
+                       normalize=False, klims=None, sparse=False):
+    """Make a kernel for a general radially symmetric 2D function.
+
+    Parameters
+    ----------
+
+    psf : `~fermipy.irfs.PSFModel`
+
+    fn : callable
+        Function that evaluates the kernel at a radial coordinate r.
+
+    sigma : float
+        68% containment radius in degrees.
+    """
+
+    if klims is None:
+        egy = psf.energies
+    else:
+        egy = psf.energies[klims[0]:klims[1] + 1]
+    ang_dist = make_pixel_distance(npix, xpix, ypix) * cdelt
+    max_ang_dist = np.max(ang_dist) + cdelt
+    #dtheta = np.linspace(0.0, (np.max(ang_dist) * 1.05)**0.5, 200)**2.0
+    # z = create_kernel_function_lookup(psf, fn, sigma, egy,
+    #                                  dtheta, psf_scale_fn)
+
+    shape = (len(egy), npix, npix)
+    k = np.zeros(shape)
+
+    r99 = psf.containment_angle(energies=egy, fraction=0.997)
+    r34 = psf.containment_angle(energies=egy, fraction=0.34)
+
+    rmin = np.maximum(r34 / 4., 0.01)
+    rmax = np.maximum(r99, 0.1)
+    if sigma is not None:
+        rmin = np.maximum(rmin, 0.5 * sigma)
+        rmax = np.maximum(rmax, 2.0 * r34 + 3.0 * sigma)
+    rmax = np.minimum(rmax, max_ang_dist)
+
+    for i in range(len(egy)):
+
+        rebin = min(int(np.ceil(cdelt / rmin[i])), 8)
+        if sparse:
+            dtheta = np.linspace(0.0, rmax[i]**0.5, 100)**2.0
+        else:
+            dtheta = np.linspace(0.0, max_ang_dist**0.5, 200)**2.0
+
+        z = eval_radial_kernel(psf, fn, sigma, i, dtheta, psf_scale_fn)
+        xdist = make_pixel_distance(npix * rebin,
+                                    xpix * rebin + (rebin - 1.0) / 2.,
+                                    ypix * rebin + (rebin - 1.0) / 2.)
+        xdist *= cdelt / float(rebin)
+        #x = val_to_pix(dtheta, np.ravel(xdist))
+
+        if sparse:
+            m = np.ravel(xdist) < rmax[i]
+            kk = np.zeros(xdist.size)
+            #kk[m] = map_coordinates(z, [x[m]], order=2, prefilter=False)
+            kk[m] = np.interp(np.ravel(xdist)[m], dtheta, z)
+            kk = kk.reshape(xdist.shape)
+        else:
+            kk = np.interp(np.ravel(xdist), dtheta, z).reshape(xdist.shape)
+            # kk = map_coordinates(z, [x], order=2,
+            #                     prefilter=False).reshape(xdist.shape)
+
+        if rebin > 1:
+            kk = sum_bins(kk, 0, rebin)
+            kk = sum_bins(kk, 1, rebin)
+
+        k[i] = kk / float(rebin)**2
+
+    k = k.reshape((len(egy),) + ang_dist.shape)
+    if normalize:
+        k /= (np.sum(k, axis=0)[np.newaxis, ...] * np.radians(cdelt) ** 2)
+
+    return k
+
+
+def eval_radial_kernel(psf, fn, sigma, idx, dtheta, psf_scale_fn):
+
+    if fn is None:
+        return psf.eval(idx, dtheta, scale_fn=psf_scale_fn)
+    else:
+        return fn(lambda t: psf.eval(idx, t, scale_fn=psf_scale_fn),
+                  dtheta, sigma)
+
+
+#@memoize
+def create_kernel_function_lookup(psf, fn, sigma, egy, dtheta, psf_scale_fn):
+
+    z = np.zeros((len(egy), len(dtheta)))
+    for i in range(len(egy)):
+
+        if fn is None:
+            z[i] = psf.eval(i, dtheta, scale_fn=psf_scale_fn)
+        else:
+            z[i] = fn(lambda t: psf.eval(i, t, scale_fn=psf_scale_fn),
+                      dtheta, sigma)
+
+    return z
+
+
+def create_radial_spline(psf, fn, sigma, egy, dtheta, psf_scale_fn):
+
+    from scipy.ndimage.interpolation import spline_filter
+
+    z = create_kernel_function_lookup(
+        psf, fn, sigma, egy, dtheta, psf_scale_fn)
+    sp = []
+    for i in range(z.shape[0]):
+        sp += [spline_filter(z[i], order=2)]
+    return sp
+
+
+def make_psf_kernel(psf, npix, cdelt, xpix, ypix, psf_scale_fn=None, normalize=False):
     """
     Generate a kernel for a point-source.
 
@@ -1321,26 +1678,23 @@ def make_psf_kernel(psf, npix, cdelt, xpix, ypix, normalize=False):
 
     npix : int
         Number of pixels in X and Y dimensions.
-    
+
     cdelt : float
         Pixel size in degrees.
-    
-    """
-     
-    dtheta = psf.dtheta
-    egy = psf.energies
 
-    x = make_pixel_offset(npix, xpix, ypix)
+    """
+
+    egy = psf.energies
+    x = make_pixel_distance(npix, xpix, ypix)
     x *= cdelt
-    
+
     k = np.zeros((len(egy), npix, npix))
     for i in range(len(egy)):
-        k[i] = 10 ** np.interp(np.ravel(x), dtheta,
-                               np.log10(psf.val[:, i])).reshape(x.shape)
+        k[i] = psf.eval(i, x, scale_fn=psf_scale_fn)
 
     if normalize:
-        k /= (np.sum(k,axis=0)[np.newaxis,...] * np.radians(cdelt) ** 2)
-         
+        k /= (np.sum(k, axis=0)[np.newaxis, ...] * np.radians(cdelt) ** 2)
+
     return k
 
 
@@ -1356,185 +1710,62 @@ def rebin_map(k, nebin, npix, rebin):
     return k
 
 
-def make_srcmap(skydir, psf, spatial_model, sigma, npix=500, xpix=0.0, ypix=0.0,
-                cdelt=0.01, rebin=1):
-    """Compute the source map for a given spatial model.
+def sum_bins(x, dim, npts):
+    if npts <= 1:
+        return x
+    shape = x.shape[:dim] + (int(x.shape[dim] / npts),
+                             npts) + x.shape[dim + 1:]
+    return np.sum(x.reshape(shape), axis=dim + 1)
+
+
+def overlap_slices(large_array_shape, small_array_shape, position):
+    """
+    Modified version of `~astropy.nddata.utils.overlap_slices`.
+
+    Get slices for the overlapping part of a small and a large array.
+
+    Given a certain position of the center of the small array, with
+    respect to the large array, tuples of slices are returned which can be
+    used to extract, add or subtract the small array at the given
+    position. This function takes care of the correct behavior at the
+    boundaries, where the small array is cut of appropriately.
 
     Parameters
     ----------
+    large_array_shape : tuple
+        Shape of the large array.
+    small_array_shape : tuple
+        Shape of the small array.
+    position : tuple
+        Position of the small array's center, with respect to the large array.
+        Coordinates should be in the same order as the array shape.
 
-    xpix : float
-
-    ypix : float
-
+    Returns
+    -------
+    slices_large : tuple of slices
+        Slices in all directions for the large array, such that
+        ``large_array[slices_large]`` extracts the region of the large array
+        that overlaps with the small array.
+    slices_small : slice
+        Slices in all directions for the small array, such that
+        ``small_array[slices_small]`` extracts the region that is inside the
+        large array.
     """
+    # Get edge coordinates
+    edges_min = [int(pos - small_shape // 2) for (pos, small_shape) in
+                 zip(position, small_array_shape)]
+    edges_max = [int(pos + (small_shape - small_shape // 2)) for
+                 (pos, small_shape) in
+                 zip(position, small_array_shape)]
 
-    energies = psf.energies
-    nebin = len(energies)
+    # Set up slices
+    slices_large = tuple(slice(max(0, edge_min), min(large_shape, edge_max))
+                         for (edge_min, edge_max, large_shape) in
+                         zip(edges_min, edges_max, large_array_shape))
+    slices_small = tuple(slice(max(0, -edge_min),
+                               min(large_shape - edge_min,
+                                   edge_max - edge_min))
+                         for (edge_min, edge_max, large_shape) in
+                         zip(edges_min, edges_max, large_array_shape))
 
-    if spatial_model == 'GaussianSource' or spatial_model == 'SpatialGaussian':
-        k = make_cgauss_kernel(psf, sigma, npix * rebin, cdelt / rebin,
-                               xpix * rebin, ypix * rebin)
-    elif spatial_model == 'DiskSource' or spatial_model == 'SpatialDisk':
-        k = make_cdisk_kernel(psf, sigma, npix * rebin, cdelt / rebin,
-                              xpix * rebin, ypix * rebin)
-    elif spatial_model == 'PSFSource' or spatial_model == 'PointSource':
-        k = make_psf_kernel(psf, npix * rebin, cdelt / rebin,
-                            xpix * rebin, ypix * rebin)
-    else:
-        raise Exception('Unrecognized spatial model: %s' % spatial_model)
-
-    if rebin > 1:
-        k = rebin_map(k, nebin, npix, rebin)
-
-    k *= psf.exp[:, np.newaxis, np.newaxis] * np.radians(cdelt) ** 2
-
-    return k
-
-
-def make_cgauss_mapcube(skydir, psf, sigma, outfile, npix=500, cdelt=0.01,
-                        rebin=1):
-    energies = psf.energies
-    nebin = len(energies)
-
-    k = make_cgauss_kernel(psf, sigma, npix * rebin, cdelt / rebin)
-
-    if rebin > 1:
-        k = rebin_map(k, nebin, npix, rebin)
-    w = create_wcs(skydir, cdelt=cdelt, crpix=npix / 2. + 0.5, naxis=3)
-
-    w.wcs.crpix[2] = 1
-    w.wcs.crval[2] = 10 ** energies[0]
-    w.wcs.cdelt[2] = energies[1] - energies[0]
-    w.wcs.ctype[2] = 'Energy'
-
-    ecol = pyfits.Column(name='Energy', format='D', array=10 ** energies)
-    hdu_energies = pyfits.BinTableHDU.from_columns([ecol], name='ENERGIES')
-
-    hdu_image = pyfits.PrimaryHDU(np.zeros((nebin, npix, npix)),
-                                  header=w.to_header())
-
-    hdu_image.data[...] = k
-
-    hdu_image.header['CUNIT3'] = 'MeV'
-
-    hdulist = pyfits.HDUList([hdu_image, hdu_energies])
-    hdulist.writeto(outfile, clobber=True)
-
-
-def make_psf_mapcube(skydir, psf, outfile, npix=500, cdelt=0.01, rebin=1):
-    energies = psf.energies
-    nebin = len(energies)
-
-    k = make_psf_kernel(psf, npix * rebin, cdelt / rebin)
-
-    if rebin > 1:
-        k = rebin_map(k, nebin, npix, rebin)
-    w = create_wcs(skydir, cdelt=cdelt, crpix=npix / 2. + 0.5, naxis=3)
-
-    w.wcs.crpix[2] = 1
-    w.wcs.crval[2] = 10 ** energies[0]
-    w.wcs.cdelt[2] = energies[1] - energies[0]
-    w.wcs.ctype[2] = 'Energy'
-
-    ecol = pyfits.Column(name='Energy', format='D', array=10 ** energies)
-    hdu_energies = pyfits.BinTableHDU.from_columns([ecol], name='ENERGIES')
-
-    hdu_image = pyfits.PrimaryHDU(np.zeros((nebin, npix, npix)),
-                                  header=w.to_header())
-
-    hdu_image.data[...] = k
-
-    hdu_image.header['CUNIT3'] = 'MeV'
-
-    hdulist = pyfits.HDUList([hdu_image, hdu_energies])
-    hdulist.writeto(outfile, clobber=True)
-
-
-def make_gaussian_spatial_map(skydir, sigma, outfile, npix=501, cdelt=0.01):
-    w = create_wcs(skydir, cdelt=cdelt, crpix=npix / 2. + 0.5)
-    hdu_image = pyfits.PrimaryHDU(np.zeros((npix, npix)),
-                                  header=w.to_header())
-
-    hdu_image.data[:, :] = make_gaussian_kernel(sigma, npix=npix, cdelt=cdelt)
-    hdulist = pyfits.HDUList([hdu_image])
-    hdulist.writeto(outfile, clobber=True)
-
-
-def make_disk_spatial_map(skydir, sigma, outfile, npix=501, cdelt=0.01):
-    w = create_wcs(skydir, cdelt=cdelt, crpix=npix / 2. + 0.5)
-
-    hdu_image = pyfits.PrimaryHDU(np.zeros((npix, npix)),
-                                  header=w.to_header())
-
-    hdu_image.data[:, :] = make_disk_kernel(sigma, npix=npix, cdelt=cdelt)
-    hdulist = pyfits.HDUList([hdu_image])
-    hdulist.writeto(outfile, clobber=True)
-
-
-def write_maps(primary_map, maps, outfile):
-    
-    hdu_images = [primary_map.create_primary_hdu()]
-    for k, v in sorted(maps.items()):
-        hdu_images += [v.create_image_hdu(k)]
-
-    hdulist = pyfits.HDUList(hdu_images)
-    hdulist.writeto(outfile, clobber=True)
-        
-    
-def write_fits_image(data, wcs, outfile):
-    hdu_image = pyfits.PrimaryHDU(data, header=wcs.to_header())
-    hdulist = pyfits.HDUList([hdu_image])
-    hdulist.writeto(outfile, clobber=True)
-
-
-def write_hpx_image(data, hpx, outfile, extname="SKYMAP"):
-    hpx.write_fits(data, outfile, extname, clobber=True)
-
-
-def delete_source_map(srcmap_file, name, logger=None):
-    """Delete a map from a binned analysis source map file if it exists.
-    
-    Parameters
-    ----------
-
-    srcmap_file : str
-       Path to the source map file.
-
-    name : str
-       HDU key of source map.
-
-    """
-    hdulist = pyfits.open(srcmap_file)
-    hdunames = [hdu.name.upper() for hdu in hdulist]
-
-    if not name.upper() in hdunames:
-        return
-
-    del hdulist[name.upper()]
-
-    hdulist.writeto(srcmap_file, clobber=True)
-
-
-def update_source_maps(srcmap_file, srcmaps, logger=None):
-    hdulist = pyfits.open(srcmap_file)
-    hdunames = [hdu.name.upper() for hdu in hdulist]
-
-    for name, data in srcmaps.items():
-
-        if not name.upper() in hdunames:
-
-            for hdu in hdulist[1:]:
-                if hdu.header['XTENSION'] == 'IMAGE':
-                    break
-
-            newhdu = pyfits.ImageHDU(data, hdu.header, name=name)
-            newhdu.header['EXTNAME'] = name
-            hdulist.append(newhdu)
-
-        if logger is not None:
-            logger.debug('Updating source map for %s' % name)
-
-        hdulist[name].data[...] = data
-
-    hdulist.writeto(srcmap_file, clobber=True)
+    return slices_large, slices_small
